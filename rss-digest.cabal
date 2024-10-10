@@ -1,0 +1,49 @@
+cabal-version:      2.4
+name:               rss-digest
+version:            0.1.0.0
+
+-- A short (one-line) description of the package.
+-- synopsis:
+
+-- A longer description of the package.
+-- description:
+
+-- A URL where users can report bugs.
+-- bug-reports:
+
+-- The license under which the package is released.
+-- license:
+author:             Chandru
+maintainer:         chandru89new@gmail.com
+
+-- A copyright notice.
+-- copyright:
+-- category:
+extra-source-files: CHANGELOG.md
+
+executable rss-digest
+    main-is:          Main.hs
+
+    -- Modules included in this executable, other than Main.
+    other-modules:  FetchChannelsList,
+                    GenerateRssList,
+                    FeedItemExtractor,
+                    FetchURL,
+                    DB,
+                    App
+
+    -- LANGUAGE extensions used by modules in this package.
+    -- other-extensions:
+    build-depends:      base ^>=4.16.4.0,
+                        scalpel >= 0.6.1,
+                        async >= 2.2,
+                        tagsoup >= 0.14.8,
+                        text >= 1.2,
+                        http-conduit >= 2.3.8,
+                        bytestring >= 0.10,
+                        sqlite-simple,
+                        transformers,
+                        resource-pool
+    hs-source-dirs:   app
+    default-language: Haskell2010
+    ghc-options: -debug
