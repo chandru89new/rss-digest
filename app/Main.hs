@@ -28,14 +28,16 @@ import Text.HTML.TagSoup (Tag (..), fromAttrib, innerText, parseTags, partitions
 import Text.HTML.TagSoup.Match (getTagContent)
 import Text.StringLike (StringLike)
 
+main = runApp $ initDB >> updateAllFeeds
+
 fetchUrl :: String -> ExceptT AppError IO String
 fetchUrl url = ExceptT $ do
-  req <- try $ parseRequest url :: IO (Either SomeException Request)
+  req <- (try' FetchError $ parseRequest url) :: IO (Either AppError Request)
   case req of
-    Left e -> pure $ Left $ FetchError $ show e
+    Left e -> pure $ Left e
     Right _req -> do
-      res <- try $ httpBS _req :: IO (Either SomeException (Response ByteString))
-      pure $ either (Left . FetchError . show) (Right . ByteString.unpack . getResponseBody) res
+      res <- try' FetchError $ httpBS _req :: IO (Either AppError (Response ByteString))
+      pure $ fmap (ByteString.unpack . getResponseBody) res
 
 type App a = Config -> ExceptT AppError IO a
 
@@ -68,15 +70,9 @@ extractFeedItem :: [Tag String] -> FeedItem
 extractFeedItem tags =
   let title = getInnerText $ takeBetween "<title>" "</title>" tags
       linkFromYtFeed = extractLinkHref tags -- youtube specific
-      link = case getInnerText $ takeBetween "<link>" "</link>" tags of
-        "" -> Nothing
-        x -> Just x
-      pubDate = case getInnerText $ takeBetween "<pubDate>" "</pubDate>" tags of
-        "" -> Nothing
-        x -> Just x
-      updatedDate = case getInnerText $ takeBetween "<updated>" "</updated>" tags of
-        "" -> Nothing
-        x -> Just x
+      link = nothingIfEmpty . getInnerText $ takeBetween "<link>" "</link>" tags
+      pubDate = nothingIfEmpty . getInnerText $ takeBetween "<pubDate>" "</pubDate>" tags
+      updatedDate = nothingIfEmpty . getInnerText $ takeBetween "<updated>" "</updated>" tags
       updated = pubDate <|> updatedDate
    in FeedItem {title = title, link = link <|> linkFromYtFeed, updated = updated >>= parseDate}
 
@@ -132,11 +128,11 @@ parseDate datetime = fmap utctDay $ firstJust $ map tryParse [fmt1, fmt2]
 
 dbFile = "./feeds.db"
 
-justRunQuery :: Connection -> Query -> ExceptT SomeException IO ()
+justRunQuery :: Connection -> Query -> ExceptT AppError IO ()
 justRunQuery conn query =
   ExceptT $ tryExecute_ conn query
 
-initializeTables :: Connection -> ExceptT SomeException IO ()
+initializeTables :: Connection -> ExceptT AppError IO ()
 initializeTables conn = do
   justRunQuery conn createFeedsTable
   justRunQuery conn createFeedItemsTable
@@ -147,51 +143,43 @@ initDB config = do
   ExceptT $ withResource connPool initTable
   where
     initTable :: Connection -> IO (Either AppError ())
-    initTable conn = do
-      result <- runExceptT $ initializeTables conn
-      pure $ either (\_ -> Left $ DatabaseError "Error when initializing the tables.") Right result
+    initTable conn = runExceptT $ initializeTables conn
 
 insertFeedItem :: Connection -> FeedItem -> IO (Either AppError FeedItem)
 insertFeedItem conn feedItem@FeedItem {..} = do
   let unwrappedLink = fromMaybe "" link
-  rows <- query_ conn (queryToCheckIfItemExists unwrappedLink) :: IO [FeedItem]
+  rows <- try' DatabaseError $ query_ conn (queryToCheckIfItemExists unwrappedLink) :: IO (Either AppError [FeedItem])
   case rows of
-    (x : _) -> pure $ Left $ DatabaseError ("Post already exists in the database: " ++ unwrappedLink ++ ".")
+    Right (x : _) -> pure $ Left $ DatabaseError ("Post already exists in the database: " ++ unwrappedLink ++ ".")
     _ -> do
-      res <- tryExecute conn insertFeedQuery $ toRow (title, link, updated) :: IO (Either SomeException ())
-      pure $ case res of
-        Left e -> Left $ DatabaseError ("Error adding this link " ++ unwrappedLink ++ " -> " ++ show e)
-        Right _ -> Right feedItem
+      res <- tryExecute conn insertFeedQuery $ toRow (title, link, updated) :: IO (Either AppError ())
+      pure $ fmap (const feedItem) res
 
 instance FromRow FeedItem where
   fromRow = FeedItem <$> field <*> field <*> field
 
-tryExecute_ :: Connection -> Query -> IO (Either SomeException ())
-tryExecute_ conn = try . execute_ conn
+tryExecute_ :: Connection -> Query -> IO (Either AppError ())
+tryExecute_ conn = try' DatabaseError . execute_ conn
 
-tryExecute :: forall q. ToRow q => Connection -> Query -> q -> IO (Either SomeException ())
-tryExecute conn query q = try $ execute conn query q
+tryExecute :: forall q. ToRow q => Connection -> Query -> q -> IO (Either AppError ())
+tryExecute conn query q = try' DatabaseError $ execute conn query q
 
-tryQuery_ :: FromRow a => Connection -> Query -> IO (Either SomeException [a])
-tryQuery_ conn = try . query_ conn
+tryQuery_ :: FromRow a => Connection -> Query -> IO (Either AppError [a])
+tryQuery_ conn = try' DatabaseError . query_ conn
 
 insertFeed :: URL -> App ()
 insertFeed feedUrl config = do
   let Config connPool = config
       query = fromString $ "INSERT INTO feeds (url) VALUES ('" ++ feedUrl ++ "');"
   ExceptT $ withResource connPool $ \conn -> do
-    result <- tryExecute_ conn query :: IO (Either SomeException ())
-    pure $ case result of
-      Left e -> Left $ DatabaseError ("Error adding this feed to database : " ++ feedUrl ++ " -> " ++ show e)
-      Right _ -> Right ()
+    result <- tryExecute_ conn query :: IO (Either AppError ())
+    pure $ void result
 
 getFeedUrlsFromDB :: App [URL]
 getFeedUrlsFromDB config = do
   let Config connPool = config
-  res <- liftIO ((try $ withResource connPool handleQuery) :: IO (Either SomeException [URL]))
-  ExceptT $ case res of
-    Left e -> (pure . Left) (DatabaseError ("Could not get feed urls from the database. " ++ show e))
-    Right urls -> (pure . Right) urls
+  res <- liftIO ((try' DatabaseError $ withResource connPool handleQuery) :: IO (Either AppError [URL]))
+  ExceptT $ pure res
   where
     handleQuery :: Connection -> IO [URL]
     handleQuery conn = do
@@ -226,12 +214,11 @@ queryToCheckIfItemExists link = fromString $ "select link, title, updated from f
 insertFeedQuery = fromString "INSERT INTO feed_items (title, link, updated) VALUES (?, ?, ?);" :: Query
 
 processFeed :: URL -> App ()
-processFeed url config = do
+processFeed url (Config connPool) = do
   _ <- liftIO $ putStrLn $ "Processing feed: " ++ url
   contents <- fetchUrl url
   feedItems <- extractFeedItems url contents
-  let Config connPool = config
-  res <- liftIO ((try $ withResource connPool $ \conn -> mapM (handleInsert conn) feedItems) :: IO (Either SomeException [Int]))
+  res <- liftIO ((try' DatabaseError $ withResource connPool $ \conn -> mapM (handleInsert conn) feedItems) :: IO (Either AppError [Int]))
   when (isRight res) $ liftIO $ putStrLn $ "Finished processing " ++ url ++ ". Discovered " ++ show (length feedItems) ++ " items. Added " ++ show (sum $ fromRight [] res) ++ " items (duplicates are ignored)."
   ExceptT $ pure (either (Left . DatabaseError . show) (Right . const ()) res)
   where
@@ -246,8 +233,15 @@ processFeeds urls config = mapM_ (flip processFeed config) urls
 
 updateAllFeeds :: App ()
 updateAllFeeds config = do
-  let Config connPool = config
   urls <- getFeedUrlsFromDB config
   processFeeds urls config
 
-main = runApp $ initDB >> updateAllFeeds
+nothingIfEmpty :: Foldable t => t a -> Maybe (t a)
+nothingIfEmpty a = if null a then Nothing else Just a
+
+try' :: (String -> AppError) -> IO a -> IO (Either AppError a)
+try' mkError action = do
+  res <- (try :: IO a -> IO (Either SomeException a)) action
+  pure $ case res of
+    Left e -> Left $ mkError $ show e
+    Right a -> Right a
