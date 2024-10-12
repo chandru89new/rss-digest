@@ -225,8 +225,6 @@ queryToCheckIfItemExists link = fromString $ "select link, title, updated from f
 
 insertFeedQuery = fromString "INSERT INTO feed_items (title, link, updated) VALUES (?, ?, ?);" :: Query
 
-main = putStrLn "Hello, Haskell!"
-
 processFeed :: URL -> App ()
 processFeed url config = do
   _ <- liftIO $ putStrLn $ "Processing feed: " ++ url
@@ -234,13 +232,13 @@ processFeed url config = do
   feedItems <- extractFeedItems url contents
   let Config connPool = config
   res <- liftIO ((try $ withResource connPool $ \conn -> mapM (handleInsert conn) feedItems) :: IO (Either SomeException [Int]))
-  when (isRight res) $ liftIO $ putStrLn $ "Finished processing " ++ url ++ ". Added " ++ show (sum $ fromRight [] res) ++ " items."
+  when (isRight res) $ liftIO $ putStrLn $ "Finished processing " ++ url ++ ". Discovered " ++ show (length feedItems) ++ " items. Added " ++ show (sum $ fromRight [] res) ++ " items (duplicates are ignored)."
   ExceptT $ pure (either (Left . DatabaseError . show) (Right . const ()) res)
   where
     handleInsert :: Connection -> FeedItem -> IO Int
     handleInsert conn feedItem = do
       res <- insertFeedItem conn feedItem
-      when (isLeft res) $ print (fromLeft (DatabaseError "Error inserting feed item") res)
+      -- when (isLeft res) $ print (fromLeft (DatabaseError "Error inserting feed item") res)
       pure $ if isLeft res then 0 else 1
 
 processFeeds :: [URL] -> App ()
@@ -252,8 +250,4 @@ updateAllFeeds config = do
   urls <- getFeedUrlsFromDB config
   processFeeds urls config
 
-test :: App ()
-test config = do
-  res <- initDB config
-  _ <- updateAllFeeds config
-  pure ()
+main = runApp $ initDB >> updateAllFeeds
