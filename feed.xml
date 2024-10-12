@@ -3,7 +3,7 @@
   <yt:videoId>OJ462SO6WPc</yt:videoId>
   <yt:channelId>UCLnczVXKdgjgmrf-RjfGQAQ</yt:channelId>
   <title>
-    Online Iskol - Elyssa D’Souza. Composed by Tatum (Babli). New Konkani Song
+    Item 1
   </title>
   <link rel="alternate" href="https://www.youtube.com/watch?v=OJ462SO6WPc" />
   <author>
@@ -41,7 +41,7 @@
   <yt:videoId>OJ462SO6WPc</yt:videoId>
   <yt:channelId>UCLnczVXKdgjgmrf-RjfGQAQ</yt:channelId>
   <title>
-    Online Iskol - Elyssa D’Souza. Composed by Tatum (Babli). New Konkani Song
+    Item 2
   </title>
   <link rel="alternate" href="https://www.youtube.com/watch?v=OJ462SO6WPc" />
   <author>
@@ -79,7 +79,7 @@
   <yt:videoId>OJ462SO6WPc</yt:videoId>
   <yt:channelId>UCLnczVXKdgjgmrf-RjfGQAQ</yt:channelId>
   <title>
-    Online Iskol - Elyssa D’Souza. Composed by Tatum (Babli). New Konkani Song
+    item 3
   </title>
   <link rel="alternate" href="https://www.youtube.com/watch?v=OJ462SO6WPc" />
   <author>
@@ -112,3 +112,59 @@
     </media:community>
   </media:group>
 </entry>
+<item>
+  <title>Haskell Journal - Day 5</title>
+  <link>https://code.druchan.com/haskell-journal-day-5</link>
+  <guid>https://code.druchan.com/haskell-journal-day-5</guid>
+  <description>
+    <ul>
+      <li>Quite possibly one of the worst days in the project so far.</li>
+      <li>At first, I set up the app to be an <code>AppM</code> monad that was basically a <code>ReaderT
+        config (ExceptT SomeException IO) a</code> — continuing from the idea from <a
+          href="/haskell-day-4">day 4</a>. It was interesting and somewhat simple to execute because
+        I had backing code from ChatGPT, and a fairly decent understanding of what was happening
+        with the <code>runApp</code> mechanics. I had a <code>runApp</code> function that took a
+        function of type <code>AppM a</code>, and then just ran it by passing it config like so:</li>
+    </ul>
+    <pre><code class="language-haskell">runApp :: AppM a -&gt; IO (Either e a) runApp app = do config &lt;- ask -- gets the global app config runExceptT $ (runReaderT app config) -- runReaderT runs the app and extracts the inner monad (ExceptT e a) -- runExceptT then runs the inner monad and returns an IO (Either e a) </code></pre>
+    <ul>
+      <li>Problems started brewing because all my lower-level functions were of the <code>ExceptT</code>
+        type. At some point, the way I was doing it, running the app returned something like <code>IO
+        (Either SomeException (Either SomeException ()))</code> — i.e., I was not passing the
+        ExceptT context correctly.</li>
+      <li>This had disastrous effects: errors were not being bubbled up (in my mind, that was the
+        whole point of wrapping the app in the ExceptT monad). Instead, they were wrapped in another
+        Either monad surrounded by the IO. Horrible. I had output that looked like this:</li>
+    </ul>
+    <pre><code class="language-haskell">Right (Left &lt;some_error_message&gt;) </code></pre>
+    <ul>
+      <li>I had a long chat with ChatGPT about these things, asking it about the idea of bubbling up
+        the errors from ExceptT without having to do <code>runExceptT</code> wherever I wanted the
+        error to be bubbled up but the ideas it returned were not working or not useful — or in some
+        cases, it was just reinventing the ExceptT or ReaderT monad transformers.</li>
+      <li>But it did tell me how to actually unwrap the ExceptTs at lower-levels (using <code>
+        runExceptT</code> of course), and then lift them in the <code>AppM</code> monad so that the
+        exceptions bubble up and are caught at the top-most function — which is exactly what I want
+        but not at the cost of having to run <code>runExceptT</code>s at the inner functions and
+        then lifting them using custom lift functions.</li>
+      <li>I had working code that did involve <code>runExceptT</code> and an interesting custom <code>
+        liftEitherAppM</code> function:</li>
+    </ul>
+    <pre><code class="language-haskell">liftEitherAppM :: Either SomeException a -&gt; AppM a liftEitherAppM = either throwE return . lift </code></pre>
+    <ul>
+      <li>As you can imagine, I spent all this time trying to understand some higher-level mechanics
+        of the app (i.e. abstraction) rather than just working on the actual functionality and it
+        was too late by the time I realized what I was doing.</li>
+      <li>One other interesting thing that I noticed was that I did not google for solutions or
+        ideas for a long time; it was almost at the end that I realized I could also just google/SO
+        for solutions. That didn't help though. Ended up posting my questions on the FP slack.</li>
+    </ul>
+    <p>Update: In the morning, I had the idea of looking at opensource Haskell projects to see what
+      patterns they use. I tried Hakyll and PostgREST: both the projects seem to be just passing
+      config to the relevant functions, so I think I will simplify the app for now to just pass <code>
+      Config</code> (the one that has connection pool so that my inner functions that deal with DB
+      can get a connection to work with) to the functions instead of using the <code>ReaderT</code>
+      monad transformer until I get some more ideas and understanding of the monad.</p>
+  </description>
+  <pubDate>Fri, 11 Oct 2024 12:00:00 +0530</pubDate>
+</item>
