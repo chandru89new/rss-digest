@@ -11,7 +11,7 @@ import Control.Applicative ((<|>))
 import Control.Exception (Exception, SomeException, throw, try)
 import Control.Monad (unless, when)
 import Control.Monad.IO.Class (MonadIO (liftIO), liftIO)
-import Data.ByteString.Char8 as ByteString (ByteString, unpack)
+import Data.ByteString.Char8 as ByteString (unpack)
 import Data.Either (fromLeft, fromRight, isLeft, isRight)
 import Data.List (intercalate)
 import Data.Maybe (fromMaybe, isJust, isNothing)
@@ -20,7 +20,7 @@ import Data.String (IsString (fromString))
 import Data.Text (pack, strip, unpack)
 import Data.Time (Day, UTCTime (utctDay), defaultTimeLocale, parseTimeM)
 import Database.SQLite.Simple (Connection, FromRow (fromRow), Query, close, execute, execute_, field, open, query_, toRow)
-import Network.HTTP.Simple (Response, getResponseBody, httpBS, parseRequest)
+import Network.HTTP.Simple (getResponseBody, httpBS, parseRequest)
 import Network.URI (URI (uriScheme), parseURI)
 import System.Environment (getArgs)
 import System.IO (hFlush, stdout)
@@ -42,18 +42,14 @@ main = do
         Just _url -> do
           runApp $ \config -> do
             res <- (try :: IO a -> IO (Either SomeException a)) $ insertFeed _url config
-            case res of
-              Left err -> print err
-              Right _ -> putStrLn "Done."
+            either print (const $ putStrLn "Done.") res
         Nothing -> putStrLn "Invalid URL."
     RemoveFeed url -> runApp $ \config -> do
       input <- userConfirmation "This will remove the feed and all the posts associated with it."
       if input
         then do
           res <- (try :: IO a -> IO (Either SomeException a)) $ removeFeed url config
-          case res of
-            Left err -> print err
-            Right _ -> putStrLn "Done."
+          either print (const $ putStrLn "Done.") res
         else putStrLn "Cancelled."
     ListFeeds -> runApp $ \config -> do
       feeds <- listFeeds config >>= pure . concat
@@ -112,14 +108,13 @@ parseURL url = case parseURI url of
 failWith :: (String -> AppError) -> IO a -> IO a
 failWith mkError action = do
   res <- (try :: IO a -> IO (Either SomeException a)) action
-  case res of
-    Left e -> throw $ (mkError . show) e
-    Right a -> pure a
+  pure $ either (throw . mkError . show) id res
 
 fetchUrl :: String -> IO String
 fetchUrl url = do
-  req <- failWith FetchError $ parseRequest url
-  res <- failWith FetchError $ httpBS req :: IO (Response ByteString)
+  res <- failWith FetchError $ do
+    req <- parseRequest url
+    httpBS req
   pure $ (ByteString.unpack . getResponseBody) res
 
 type App a = Config -> IO a
@@ -142,9 +137,7 @@ runApp app = do
   let config = Config {connPool = pool}
   res <- (try :: IO a -> IO (Either AppError a)) $ app config
   destroyAllResources pool
-  case res of
-    Left err -> throw err
-    Right _ -> return ()
+  either throw (const $ return ()) res
 
 trim :: String -> String
 trim = Data.Text.unpack . strip . pack
@@ -247,9 +240,8 @@ instance FromRow FeedItem where
   fromRow = FeedItem <$> field <*> field <*> field
 
 insertFeed :: URL -> App ()
-insertFeed feedUrl config = do
-  let Config connPool = config
-      query = fromString $ "INSERT INTO feeds (url) VALUES ('" ++ feedUrl ++ "');"
+insertFeed feedUrl (Config {..}) = do
+  let query = fromString $ "INSERT INTO feeds (url) VALUES ('" ++ feedUrl ++ "');"
   withResource connPool $ \conn -> failWith DatabaseError $ execute_ conn query
 
 getFeedUrlsFromDB :: App [(Int, URL)]
