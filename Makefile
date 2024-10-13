@@ -1,5 +1,5 @@
 build:
-	cabal build --disable-profiling --enable-split-sections && cabal install --overwrite-policy=always
+	cabal build --disable-profiling --enable-split-sections && cabal install --overwrite-policy=always --disable-profiling --enable-split-sections
 	
 clean-build:
 	cabal clean && make build

@@ -23,6 +23,7 @@ import Database.SQLite.Simple (Connection, FromRow (fromRow), Query, close, exec
 import Network.HTTP.Simple (Response, getResponseBody, httpBS, parseRequest)
 import Network.URI (URI (uriScheme), parseURI)
 import System.Environment (getArgs)
+import System.IO (hFlush, stdout)
 import Text.HTML.TagSoup (Tag (..), fromAttrib, innerText, parseTags, partitions, (~/=), (~==))
 
 main :: IO ()
@@ -46,10 +47,14 @@ main = do
               Right _ -> putStrLn "Done."
         Nothing -> putStrLn "Invalid URL."
     RemoveFeed url -> runApp $ \config -> do
-      res <- (try :: IO a -> IO (Either SomeException a)) $ removeFeed url config
-      case res of
-        Left err -> print err
-        Right _ -> putStrLn "Done."
+      input <- userConfirmation "This will remove the feed and all the posts associated with it."
+      if input
+        then do
+          res <- (try :: IO a -> IO (Either SomeException a)) $ removeFeed url config
+          case res of
+            Left err -> print err
+            Right _ -> putStrLn "Done."
+        else putStrLn "Cancelled."
     ListFeeds -> runApp $ \config -> do
       feeds <- listFeeds config >>= pure . concat
       putStrLn $ intercalate "\n" feeds
@@ -58,9 +63,13 @@ main = do
         updateAllFeeds config
         putStrLn "Done."
     PurgeEverything -> do
-      putStrLn "Nuking everything..."
-      _ <- runApp destroyDB
-      putStrLn "Fin."
+      input <- userConfirmation "This will remove all feeds and all the posts associated with them."
+      if input
+        then do
+          putStrLn "Nuking everything..."
+          _ <- runApp destroyDB
+          putStrLn "Fin."
+        else putStrLn "Cancelled."
     InvalidCommand -> putStrLn progHelp
 
 progHelp :: String
@@ -69,7 +78,7 @@ progHelp =
   \Commands:\n\
   \  help - Show this help.\n\
   \  add <url> - Add a feed. <url> must be valid HTTP(S) URL.\n\
-  \  remove <url> - Remove a feed with the given url. TODO: does not remove all posts associated with that field yet.\n\
+  \  remove <url> - Remove a feed and all its associated posts with the given url.\n\
   \  list feeds - List all feeds\n\
   \  refresh - Refresh all feeds\n\
   \  purge - Purge everything\n"
@@ -92,6 +101,7 @@ getCommand = do
     ("list" : "feeds" : _) -> ListFeeds
     ("refresh" : _) -> RefreshFeeds
     ("purge" : _) -> PurgeEverything
+    ("help" : _) -> InvalidCommand
     _ -> InvalidCommand
 
 parseURL :: String -> Maybe URL
@@ -335,3 +345,10 @@ listFeeds (Config connPool) = do
 
 setPragmas :: Connection -> IO ()
 setPragmas = flip execute_ (fromString "PRAGMA foreign_keys = ON;")
+
+userConfirmation :: String -> IO Bool
+userConfirmation msg = do
+  putStr $ msg ++ " Type 'y' and hit enter to confirm. Any other key to abort: "
+  hFlush stdout
+  input <- getLine
+  pure $ input == "y" || input == "Y"
