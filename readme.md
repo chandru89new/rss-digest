@@ -1,4 +1,4 @@
-## Todo
-
-- [ ] remove `scalpel` and use `tagsoup` in the rss link fetcher
-- [ ] use `EitherT/ExceptT` instead of the `IO (Either e a)` wrangling
+- I havent decided on a name for this project yet.
+- This is supposed to be (at the time of writing this) a tool to create "daily digest" for me to read/catch up on from RSS feeds that I add into the system. It may morph into something else as I keep building/working on it.
+- It's a project concocted to learn and build things in Haskell.
+- I am [journaling it on my dev blog](https://code.druchan.com) (look for posts titled `Haskell Journal - Day ..`).
