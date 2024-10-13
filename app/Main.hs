@@ -9,7 +9,7 @@ module Main where
 
 import Control.Applicative ((<|>))
 import Control.Exception (Exception, SomeException, throw, try)
-import Control.Monad (when)
+import Control.Monad (unless, when)
 import Control.Monad.IO.Class (MonadIO (liftIO), liftIO)
 import Data.ByteString.Char8 as ByteString (ByteString, unpack)
 import Data.Either (fromLeft, fromRight, isLeft, isRight)
@@ -28,13 +28,18 @@ import Text.HTML.TagSoup (Tag (..), fromAttrib, innerText, parseTags, partitions
 main :: IO ()
 main = do
   command <- getCommand
+  unless (command == InvalidCommand) $
+    runApp
+      ( \config -> do
+          _ <- initDB config
+          pure ()
+      )
   case command of
     AddFeed link -> do
       let url = parseURL link
       case url of
         Just _url -> do
           runApp $ \config -> do
-            initDB config
             res <- (try :: IO a -> IO (Either SomeException a)) $ insertFeed _url config
             case res of
               Left err -> print err
@@ -50,7 +55,6 @@ main = do
       putStrLn $ intercalate "\n" feeds
     RefreshFeeds -> do
       runApp $ \config -> do
-        initDB config
         updateAllFeeds config
         putStrLn "Done."
     PurgeEverything -> do
@@ -77,6 +81,7 @@ data Command
   | RemoveFeed URL
   | PurgeEverything
   | InvalidCommand
+  deriving (Eq)
 
 getCommand :: IO Command
 getCommand = do
@@ -206,21 +211,26 @@ justRunQuery conn query = do
 
 initializeTables :: Connection -> IO ()
 initializeTables conn = do
-  justRunQuery conn createFeedsTable
+  _ <- justRunQuery conn createFeedsTable
   justRunQuery conn createFeedItemsTable
 
 initDB :: App ()
 initDB (Config connPool) = do
-  withResource connPool initializeTables
+  withResource
+    connPool
+    ( \conn -> do
+        _ <- setPragmas conn
+        initializeTables conn
+    )
 
-insertFeedItem :: Connection -> FeedItem -> IO (Maybe FeedItem)
-insertFeedItem conn feedItem@FeedItem {..} = do
+insertFeedItem :: Connection -> (Int, FeedItem) -> IO (Maybe FeedItem)
+insertFeedItem conn (feedId, feedItem@FeedItem {..}) = do
   let unwrappedLink = fromMaybe "" link
   rows <- failWith DatabaseError $ query_ conn (queryToCheckIfItemExists unwrappedLink) :: IO [FeedItem]
   case rows of
     (_ : _) -> pure Nothing
     _ -> do
-      _ <- failWith DatabaseError $ execute conn insertFeedQuery $ toRow (title, link, updated) :: IO ()
+      _ <- failWith DatabaseError $ execute conn insertFeedQuery $ toRow (title, link, updated, feedId) :: IO ()
       pure (Just feedItem)
 
 instance FromRow FeedItem where
@@ -232,13 +242,12 @@ insertFeed feedUrl config = do
       query = fromString $ "INSERT INTO feeds (url) VALUES ('" ++ feedUrl ++ "');"
   withResource connPool $ \conn -> failWith DatabaseError $ execute_ conn query
 
-getFeedUrlsFromDB :: App [URL]
+getFeedUrlsFromDB :: App [(Int, URL)]
 getFeedUrlsFromDB (Config connPool) = failWith DatabaseError $ withResource connPool handleQuery
   where
-    handleQuery :: Connection -> IO [URL]
+    handleQuery :: Connection -> IO [(Int, URL)]
     handleQuery conn = do
-      rows <- query_ conn selectUrlFromFeeds :: IO [(Int, String)]
-      pure $ map snd rows
+      query_ conn selectUrlFromFeeds :: IO [(Int, String)]
 
 createFeedItemsTable :: Query
 createFeedItemsTable =
@@ -247,7 +256,9 @@ createFeedItemsTable =
     \ link TEXT NOT NULL PRIMARY KEY, \
     \ title TEXT NOT NULL, \
     \ updated DATETIME DEFAULT CURRENT_TIMESTAMP, \
-    \ state TEXT DEFAULT 'unread'  \
+    \ state TEXT DEFAULT 'unread',  \
+    \ feed_id INTEGER NOT NULL,  \
+    \ FOREIGN KEY (feed_id) REFERENCES feeds(id) ON DELETE CASCADE \
     \);"
 
 createFeedsTable :: Query
@@ -269,25 +280,30 @@ queryToCheckIfItemExists :: String -> Query
 queryToCheckIfItemExists link = fromString $ "select link, title, updated from feed_items where link = '" ++ link ++ "' limit 1;"
 
 insertFeedQuery :: Query
-insertFeedQuery = fromString "INSERT INTO feed_items (title, link, updated) VALUES (?, ?, ?);" :: Query
+insertFeedQuery = fromString "INSERT INTO feed_items (title, link, updated, feed_id) VALUES (?, ?, ?, ?);" :: Query
 
-processFeed :: URL -> App ()
-processFeed url (Config connPool) = do
+processFeed :: (Int, URL) -> App ()
+processFeed (feedId, url) (Config connPool) = do
   _ <- liftIO $ putStrLn $ "Processing feed: " ++ url
   contents <- fetchUrl url
   let feedItems = extractFeedItems contents
       unwrappedFeedItems = fromMaybe [] feedItems
   when (isNothing feedItems) $ putStrLn $ "No posts found on link: " ++ url ++ "."
-  res <- (try $ failWith DatabaseError $ withResource connPool $ \conn -> mapM (handleInsert conn) unwrappedFeedItems) :: IO (Either AppError [Int])
+  res <-
+    ( try $ failWith DatabaseError $ withResource connPool $ \conn -> do
+        _ <- setPragmas conn
+        mapM (handleInsert conn) unwrappedFeedItems
+    ) ::
+      IO (Either AppError [Int])
   when ((not . null) unwrappedFeedItems && isRight res) $ liftIO $ putStrLn $ "Finished processing " ++ url ++ ". Discovered " ++ show (length unwrappedFeedItems) ++ " posts. Added " ++ show (sum $ fromRight [] res) ++ " posts (duplicates are ignored)."
   where
     handleInsert :: Connection -> FeedItem -> IO Int
     handleInsert conn feedItem = do
-      res <- (try $ insertFeedItem conn feedItem) :: IO (Either AppError (Maybe FeedItem))
+      res <- (try $ insertFeedItem conn (feedId, feedItem)) :: IO (Either AppError (Maybe FeedItem))
       when (isLeft res) $ print (fromLeft (DatabaseError "Error inserting feed item") res)
       pure $ either (const 0) (\r -> if isJust r then 1 else 0) res
 
-processFeeds :: [URL] -> App ()
+processFeeds :: [(Int, URL)] -> App ()
 processFeeds urls config = mapM_ (flip processFeed config) urls
 
 updateAllFeeds :: App ()
@@ -301,12 +317,13 @@ nothingIfEmpty a = if null a then Nothing else Just a
 destroyDB :: App ()
 destroyDB (Config connPool) =
   withResource connPool $ \conn -> do
-    justRunQuery conn $ fromString "DROP TABLE IF EXISTS feed_items;"
+    _ <- justRunQuery conn $ fromString "DROP TABLE IF EXISTS feed_items;"
     justRunQuery conn $ fromString "DROP TABLE IF EXISTS feeds;"
 
 removeFeed :: URL -> App ()
 removeFeed url (Config connPool) =
   withResource connPool $ \conn -> do
+    _ <- setPragmas conn
     res <- failWith DatabaseError $ query_ conn (fromString $ "SELECT id, url FROM feeds where url = '" ++ url ++ "';") :: IO [(Int, String)]
     when (null res) $ throw $ DatabaseError "Feed not found."
     justRunQuery conn $ fromString $ "DELETE FROM feeds where url = '" ++ url ++ "';"
@@ -315,3 +332,6 @@ listFeeds :: App [[String]]
 listFeeds (Config connPool) = do
   withResource connPool $ \conn -> do
     failWith DatabaseError $ query_ conn selectAllFeeds :: IO [[String]]
+
+setPragmas :: Connection -> IO ()
+setPragmas = flip execute_ (fromString "PRAGMA foreign_keys = ON;")
