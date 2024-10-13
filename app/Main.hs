@@ -8,6 +8,8 @@
 module Main where
 
 import Control.Applicative ((<|>))
+import Control.Concurrent (newMVar, withMVar)
+import Control.Concurrent.Async (mapConcurrently_)
 import Control.Exception (Exception, SomeException, throw, try)
 import Control.Monad (when)
 import Control.Monad.IO.Class (MonadIO (liftIO), liftIO)
@@ -20,6 +22,7 @@ import Data.String (IsString (fromString))
 import Data.Text (pack, strip, unpack)
 import Data.Time (Day, UTCTime (utctDay), defaultTimeLocale, parseTimeM)
 import Database.SQLite.Simple (Connection, FromRow (fromRow), Query, close, execute, execute_, field, open, query_, toRow)
+import GHC.MVar (MVar)
 import Network.HTTP.Simple (Response, getResponseBody, httpBS, parseRequest)
 import Network.URI (URI (uriScheme), parseURI)
 import System.Environment (getArgs)
@@ -103,7 +106,7 @@ failWith mkError action = do
 
 fetchUrl :: String -> IO String
 fetchUrl url = do
-  req <- failWith FetchError $ parseRequest url
+  req <- failWith (\_ -> FetchError "Invalid URL.") $ parseRequest url
   res <- failWith FetchError $ httpBS req :: IO (Response ByteString)
   pure $ (ByteString.unpack . getResponseBody) res
 
@@ -271,15 +274,18 @@ queryToCheckIfItemExists link = fromString $ "select link, title, updated from f
 insertFeedQuery :: Query
 insertFeedQuery = fromString "INSERT INTO feed_items (title, link, updated) VALUES (?, ?, ?);" :: Query
 
-processFeed :: URL -> App ()
-processFeed url (Config connPool) = do
-  _ <- liftIO $ putStrLn $ "Processing feed: " ++ url
-  contents <- fetchUrl url
-  let feedItems = extractFeedItems contents
-      unwrappedFeedItems = fromMaybe [] feedItems
-  when (isNothing feedItems) $ putStrLn $ "No posts found on link: " ++ url ++ "."
-  res <- (try $ failWith DatabaseError $ withResource connPool $ \conn -> mapM (handleInsert conn) unwrappedFeedItems) :: IO (Either AppError [Int])
-  when ((not . null) unwrappedFeedItems && isRight res) $ liftIO $ putStrLn $ "Finished processing " ++ url ++ ". Discovered " ++ show (length unwrappedFeedItems) ++ " posts. Added " ++ show (sum $ fromRight [] res) ++ " posts (duplicates are ignored)."
+processFeed :: MVar () -> URL -> App ()
+processFeed lock url (Config connPool) = do
+  contents <- withMVar lock $ \_ -> do
+    _ <- liftIO $ putStrLn $ "Processing feed: " ++ url
+    (try :: IO a -> IO (Either SomeException a)) $ fetchUrl url
+  when (isLeft contents) $ print $ FetchError "Error fetching feed"
+  when (isRight contents) $ do
+    let feedItems = extractFeedItems (fromRight "" contents)
+        unwrappedFeedItems = fromMaybe [] feedItems
+    when (isNothing feedItems) $ putStrLn $ "No posts found on link: " ++ url ++ "."
+    res <- (try $ failWith DatabaseError $ withResource connPool $ \conn -> mapM (handleInsert conn) unwrappedFeedItems) :: IO (Either AppError [Int])
+    when ((not . null) unwrappedFeedItems && isRight res) $ liftIO $ putStrLn $ "Finished processing " ++ url ++ ". Discovered " ++ show (length unwrappedFeedItems) ++ " posts. Added " ++ show (sum $ fromRight [] res) ++ " posts (duplicates are ignored)."
   where
     handleInsert :: Connection -> FeedItem -> IO Int
     handleInsert conn feedItem = do
@@ -288,7 +294,9 @@ processFeed url (Config connPool) = do
       pure $ either (const 0) (\r -> if isJust r then 1 else 0) res
 
 processFeeds :: [URL] -> App ()
-processFeeds urls config = mapM_ (flip processFeed config) urls
+processFeeds urls config = do
+  lock <- newMVar ()
+  mapConcurrently_ (flip (processFeed lock) config) urls
 
 updateAllFeeds :: App ()
 updateAllFeeds config = do
