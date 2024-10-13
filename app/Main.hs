@@ -192,9 +192,9 @@ parseDate datetime = fmap utctDay $ firstJust $ map tryParse [fmt1, fmt2]
     firstJust xs = go xs Nothing
       where
         go [] acc = acc
-        go (x : _) acc = case x of
+        go (x : xs_) acc = case x of
           Just y -> Just y
-          Nothing -> go xs acc
+          Nothing -> go xs_ acc
 
 dbFile :: String
 dbFile = "./feeds.db"
