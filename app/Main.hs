@@ -9,7 +9,7 @@ module Main where
 
 import Control.Applicative ((<|>))
 import Control.Exception (Exception, SomeException, throw, try)
-import Control.Monad (unless, when)
+import Control.Monad (when)
 import Control.Monad.IO.Class (MonadIO (liftIO), liftIO)
 import Data.ByteString.Char8 as ByteString (ByteString, unpack)
 import Data.Either (fromLeft, fromRight, isLeft, isRight)
@@ -65,7 +65,7 @@ progHelp =
   \Commands:\n\
   \  help - Show this help.\n\
   \  add <url> - Add a feed. <url> must be valid HTTP(S) URL.\n\
-  \  remove <url> - Remove a feed with the given url. TODO: does not remove all feed items associated with that field yet.\n\
+  \  remove <url> - Remove a feed with the given url. TODO: does not remove all posts associated with that field yet.\n\
   \  list feeds - List all feeds\n\
   \  refresh - Refresh all feeds\n\
   \  purge - Purge everything\n"
@@ -277,9 +277,9 @@ processFeed url (Config connPool) = do
   contents <- fetchUrl url
   let feedItems = extractFeedItems contents
       unwrappedFeedItems = fromMaybe [] feedItems
-  when (isNothing feedItems) $ putStrLn $ "No items found on link: " ++ url ++ "."
+  when (isNothing feedItems) $ putStrLn $ "No posts found on link: " ++ url ++ "."
   res <- (try $ failWith DatabaseError $ withResource connPool $ \conn -> mapM (handleInsert conn) unwrappedFeedItems) :: IO (Either AppError [Int])
-  unless (null unwrappedFeedItems && isRight res) $ liftIO $ putStrLn $ "Finished processing " ++ url ++ ". Discovered " ++ show (length unwrappedFeedItems) ++ " items. Added " ++ show (sum $ fromRight [] res) ++ " items (duplicates are ignored)."
+  when ((not . null) unwrappedFeedItems && isRight res) $ liftIO $ putStrLn $ "Finished processing " ++ url ++ ". Discovered " ++ show (length unwrappedFeedItems) ++ " posts. Added " ++ show (sum $ fromRight [] res) ++ " posts (duplicates are ignored)."
   where
     handleInsert :: Connection -> FeedItem -> IO Int
     handleInsert conn feedItem = do
