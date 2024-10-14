@@ -18,7 +18,7 @@ import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Pool (Pool, defaultPoolConfig, destroyAllResources, newPool, withResource)
 import Data.String (IsString (fromString))
 import Data.Text (pack, strip, unpack)
-import Data.Time (Day, UTCTime (utctDay), defaultTimeLocale, parseTimeM)
+import Data.Time (Day, UTCTime (utctDay), defaultTimeLocale, getCurrentTime, parseTimeM)
 import Database.SQLite.Simple (Connection, FromRow (fromRow), Query, close, execute, execute_, field, open, query_, toRow)
 import Network.HTTP.Simple (getResponseBody, httpBS, parseRequest)
 import Network.URI (URI (uriScheme), parseURI)
@@ -58,6 +58,20 @@ main = do
       runApp $ \config -> do
         updateAllFeeds config
         putStrLn "Done."
+    CreateDigest dateString -> do
+      today <- fmap utctDay getCurrentTime
+      digestDay <- case dateString of
+        Just date -> (try :: IO a -> IO (Either SomeException a)) (parseTimeM True defaultTimeLocale "%Y-%m-%d" date :: IO Day)
+        Nothing -> pure $ Right today
+      case digestDay of
+        Right day -> do
+          runApp $ \config -> do
+            items <- createDigest day config
+            putStrLn $ "Digest for " ++ show day ++ ":"
+            when (null items) $ putStrLn $ "No digest for " ++ show day ++ "."
+            mapM_ logFeedItem items
+        Left _ -> do
+          putStrLn "Invalid date format. Use YYYY-MM-DD or leave empty to get today's digest. (e.g 2020-01-01)"
     PurgeEverything -> do
       input <- userConfirmation "This will remove all feeds and all the posts associated with them."
       if input
@@ -84,6 +98,7 @@ data Command
   | RefreshFeeds
   | ListFeeds
   | RemoveFeed URL
+  | CreateDigest (Maybe String)
   | PurgeEverything
   | InvalidCommand
   deriving (Eq)
@@ -96,6 +111,7 @@ getCommand = do
     ("remove" : url : _) -> RemoveFeed url
     ("list" : "feeds" : _) -> ListFeeds
     ("refresh" : _) -> RefreshFeeds
+    ("digest" : xs) -> CreateDigest (if null xs then Nothing else Just $ head xs)
     ("purge" : _) -> PurgeEverything
     ("help" : _) -> InvalidCommand
     _ -> InvalidCommand
@@ -224,16 +240,17 @@ initDB (Config connPool) = do
     ( \conn -> do
         _ <- setPragmas conn
         initializeTables conn
+        runMigrations conn
     )
 
-insertFeedItem :: Connection -> (Int, FeedItem) -> IO (Maybe FeedItem)
-insertFeedItem conn (feedId, feedItem@FeedItem {..}) = do
+insertFeedItem :: Connection -> (Int, Day, FeedItem) -> IO (Maybe FeedItem)
+insertFeedItem conn (feedId, addedOn, feedItem@FeedItem {..}) = do
   let unwrappedLink = fromMaybe "" link
   rows <- failWith DatabaseError $ query_ conn (queryToCheckIfItemExists unwrappedLink) :: IO [FeedItem]
   case rows of
     (_ : _) -> pure Nothing
     _ -> do
-      _ <- failWith DatabaseError $ execute conn insertFeedQuery $ toRow (title, link, updated, feedId) :: IO ()
+      _ <- failWith DatabaseError $ execute conn insertFeedQuery $ toRow (title, link, updated, feedId, addedOn) :: IO ()
       pure (Just feedItem)
 
 instance FromRow FeedItem where
@@ -282,10 +299,10 @@ queryToCheckIfItemExists :: String -> Query
 queryToCheckIfItemExists link = fromString $ "select link, title, updated from feed_items where link = '" ++ link ++ "' limit 1;"
 
 insertFeedQuery :: Query
-insertFeedQuery = fromString "INSERT INTO feed_items (title, link, updated, feed_id) VALUES (?, ?, ?, ?);" :: Query
+insertFeedQuery = fromString "INSERT INTO feed_items (title, link, updated, feed_id, created_at) VALUES (?, ?, ?, ?, ?);" :: Query
 
-processFeed :: (Int, URL) -> App ()
-processFeed (feedId, url) (Config connPool) = do
+processFeed :: (Int, URL) -> Day -> App ()
+processFeed (feedId, url) addedOn (Config connPool) = do
   _ <- liftIO $ putStrLn $ "Processing feed: " ++ url
   contents <- fetchUrl url
   let feedItems = extractFeedItems contents
@@ -301,12 +318,15 @@ processFeed (feedId, url) (Config connPool) = do
   where
     handleInsert :: Connection -> FeedItem -> IO Int
     handleInsert conn feedItem = do
-      res <- (try $ insertFeedItem conn (feedId, feedItem)) :: IO (Either AppError (Maybe FeedItem))
+      res <- (try $ insertFeedItem conn (feedId, addedOn, feedItem)) :: IO (Either AppError (Maybe FeedItem))
       when (isLeft res) $ print (fromLeft (DatabaseError "Error inserting feed item") res)
       pure $ either (const 0) (\r -> if isJust r then 1 else 0) res
 
 processFeeds :: [(Int, URL)] -> App ()
-processFeeds urls config = mapM_ (flip processFeed config) urls
+processFeeds urls config = do
+  utcTime <- getCurrentTime
+  let addedOn = utctDay utcTime
+  mapM_ (\url -> processFeed url addedOn config) urls
 
 updateAllFeeds :: App ()
 updateAllFeeds config = do
@@ -344,3 +364,24 @@ userConfirmation msg = do
   hFlush stdout
   input <- getLine
   pure $ input == "y" || input == "Y"
+
+runMigrations :: Connection -> IO ()
+runMigrations conn = do
+  let addCreatedAtToFeeds = fromString "ALTER TABLE feeds ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP;" :: Query
+      addCreateAtToFeedItems = fromString "ALTER TABLE feed_items ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP;" :: Query
+      updateCreatedAtFeeds = fromString "UPDATE feeds SET created_at = CURRENT_TIMESTAMP where created_at is null" :: Query
+      updateCreatedAtFeedItems = fromString "UPDATE feed_items SET created_at = CURRENT_TIMESTAMP where created_at is null" :: Query
+  failWith DatabaseError $ execute_ conn $ fromString "PRAGMA foreign_keys = ON;"
+  failWith DatabaseError $ execute_ conn addCreatedAtToFeeds
+  failWith DatabaseError $ execute_ conn addCreateAtToFeedItems
+  failWith DatabaseError $ execute_ conn updateCreatedAtFeeds
+  failWith DatabaseError $ execute_ conn updateCreatedAtFeedItems
+
+createDigest :: Day -> App [FeedItem]
+createDigest day config =
+  withResource (connPool config) $ \conn -> do
+    let query = fromString $ "SELECT title, link, updated FROM feed_items where created_at = '" ++ show day ++ "';" :: Query
+    failWith DatabaseError $ query_ conn query :: IO [FeedItem]
+
+logFeedItem :: FeedItem -> IO ()
+logFeedItem FeedItem {..} = putStrLn $ title ++ "(" ++ fromMaybe "" link ++ ")"
