@@ -19,7 +19,7 @@ maintainer:         chandru89new@gmail.com
 -- A copyright notice.
 -- copyright:
 -- category:
-extra-source-files: CHANGELOG.md
+extra-source-files: CHANGELOG.md, digest-template.html
 
 executable rss-digest
     main-is:          Main.hs
@@ -41,7 +41,8 @@ executable rss-digest
                         transformers,
                         resource-pool,
                         network-uri,
-                        time
+                        time,
+                        file-embed
     hs-source-dirs:   app
     default-language: Haskell2010
     ghc-options: -rtsopts=none -threaded -O2 -split-sections -Wall -Wincomplete-patterns

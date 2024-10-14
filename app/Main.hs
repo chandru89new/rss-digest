@@ -1,9 +1,11 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
 {-# HLINT ignore "Use section" #-}
 {-# HLINT ignore "Use <&>" #-}
+{-# HLINT ignore "Use <$>" #-}
 
 module Main where
 
@@ -13,15 +15,16 @@ import Control.Monad (unless, when)
 import Control.Monad.IO.Class (MonadIO (liftIO), liftIO)
 import Data.ByteString.Char8 as ByteString (unpack)
 import Data.Either (fromLeft, fromRight, isLeft, isRight)
+import Data.FileEmbed (embedFile)
 import Data.List (intercalate)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Pool (Pool, defaultPoolConfig, destroyAllResources, newPool, withResource)
 import Data.String (IsString (fromString))
-import Data.Text (pack, strip, unpack)
-import Data.Time (Day, UTCTime (utctDay), defaultTimeLocale, getCurrentTime, parseTimeM)
+import Data.Text (pack, replace, strip, unpack)
+import Data.Time (Day, UTCTime (utctDay), defaultTimeLocale, formatTime, getCurrentTime, parseTimeM)
 import Database.SQLite.Simple (Connection, FromRow (fromRow), Query, close, execute, execute_, field, open, query_, toRow)
 import Network.HTTP.Simple (getResponseBody, httpBS, parseRequest)
-import Network.URI (URI (uriScheme), parseURI)
+import Network.URI (URI (uriAuthority, uriScheme), URIAuth (..), parseURI)
 import System.Environment (getArgs)
 import System.IO (hFlush, stdout)
 import Text.HTML.TagSoup (Tag (..), fromAttrib, innerText, parseTags, partitions, (~/=), (~==))
@@ -65,11 +68,14 @@ main = do
         Nothing -> pure $ Right today
       case digestDay of
         Right day -> do
-          runApp $ \config -> do
+          runApp $ \config@Config {..} -> do
             items <- createDigest day config
-            putStrLn $ "Digest for " ++ show day ++ ":"
-            when (null items) $ putStrLn $ "No digest for " ++ show day ++ "."
-            mapM_ logFeedItem items
+            if null items
+              then putStrLn $ "No digest for " ++ show day ++ "."
+              else do
+                putStrLn $ "Preparing digest for " ++ show day ++ ":"
+                file <- writeDigest template day items
+                putStrLn $ "Digest written to " ++ file ++ "."
         Left _ -> do
           putStrLn "Invalid date format. Use YYYY-MM-DD or leave empty to get today's digest. (e.g 2020-01-01)"
     PurgeEverything -> do
@@ -89,6 +95,8 @@ progHelp =
   \  help - Show this help.\n\
   \  add <url> - Add a feed. <url> must be valid HTTP(S) URL.\n\
   \  remove <url> - Remove a feed and all its associated posts with the given url.\n\
+  \  digest - Generate the digest for today.\n\
+  \  digest <date> - Generate the digest for a given [date] in the YYYY-MM-DD format.\n\
   \  list feeds - List all feeds\n\
   \  refresh - Refresh all feeds\n\
   \  purge - Purge everything\n"
@@ -139,18 +147,20 @@ data AppError
   = FetchError String
   | DatabaseError String
   | FeedParseError String
+  | DigestError String
   | GeneralError String
   deriving (Show)
 
 instance Exception AppError
 
-newtype Config = Config
-  {connPool :: Pool Connection}
+data Config = Config
+  {connPool :: Pool Connection, template :: String}
 
 runApp :: App a -> IO ()
 runApp app = do
+  let template = $(embedFile "./template.html")
   pool <- newPool (defaultPoolConfig (open dbFile) close 60.0 10)
-  let config = Config {connPool = pool}
+  let config = Config {connPool = pool, template = ByteString.unpack template}
   res <- (try :: IO a -> IO (Either AppError a)) $ app config
   destroyAllResources pool
   either throw (const $ return ()) res
@@ -234,7 +244,7 @@ initializeTables conn = do
   justRunQuery conn createFeedItemsTable
 
 initDB :: App ()
-initDB (Config connPool) = do
+initDB (Config {..}) = do
   withResource
     connPool
     ( \conn -> do
@@ -262,7 +272,7 @@ insertFeed feedUrl (Config {..}) = do
   withResource connPool $ \conn -> failWith DatabaseError $ execute_ conn query
 
 getFeedUrlsFromDB :: App [(Int, URL)]
-getFeedUrlsFromDB (Config connPool) = failWith DatabaseError $ withResource connPool handleQuery
+getFeedUrlsFromDB (Config {..}) = failWith DatabaseError $ withResource connPool handleQuery
   where
     handleQuery :: Connection -> IO [(Int, URL)]
     handleQuery conn = do
@@ -302,7 +312,7 @@ insertFeedQuery :: Query
 insertFeedQuery = fromString "INSERT INTO feed_items (title, link, updated, feed_id, created_at) VALUES (?, ?, ?, ?, ?);" :: Query
 
 processFeed :: (Int, URL) -> Day -> App ()
-processFeed (feedId, url) addedOn (Config connPool) = do
+processFeed (feedId, url) addedOn (Config {..}) = do
   _ <- liftIO $ putStrLn $ "Processing feed: " ++ url
   contents <- fetchUrl url
   let feedItems = extractFeedItems contents
@@ -337,13 +347,13 @@ nothingIfEmpty :: Foldable t => t a -> Maybe (t a)
 nothingIfEmpty a = if null a then Nothing else Just a
 
 destroyDB :: App ()
-destroyDB (Config connPool) =
+destroyDB (Config {..}) =
   withResource connPool $ \conn -> do
     _ <- justRunQuery conn $ fromString "DROP TABLE IF EXISTS feed_items;"
     justRunQuery conn $ fromString "DROP TABLE IF EXISTS feeds;"
 
 removeFeed :: URL -> App ()
-removeFeed url (Config connPool) =
+removeFeed url (Config {..}) =
   withResource connPool $ \conn -> do
     _ <- setPragmas conn
     res <- failWith DatabaseError $ query_ conn (fromString $ "SELECT id, url FROM feeds where url = '" ++ url ++ "';") :: IO [(Int, String)]
@@ -351,7 +361,7 @@ removeFeed url (Config connPool) =
     justRunQuery conn $ fromString $ "DELETE FROM feeds where url = '" ++ url ++ "';"
 
 listFeeds :: App [[String]]
-listFeeds (Config connPool) = do
+listFeeds (Config {..}) = do
   withResource connPool $ \conn -> do
     failWith DatabaseError $ query_ conn selectAllFeeds :: IO [[String]]
 
@@ -360,7 +370,8 @@ setPragmas = flip execute_ (fromString "PRAGMA foreign_keys = ON;")
 
 userConfirmation :: String -> IO Bool
 userConfirmation msg = do
-  putStr $ msg ++ " Type 'y' and hit enter to confirm. Any other key to abort: "
+  putStrLn msg
+  putStr "Type 'y' and hit enter to confirm. Any other key to abort: "
   hFlush stdout
   input <- getLine
   pure $ input == "y" || input == "Y"
@@ -380,8 +391,42 @@ runMigrations conn = do
 createDigest :: Day -> App [FeedItem]
 createDigest day config =
   withResource (connPool config) $ \conn -> do
-    let query = fromString $ "SELECT title, link, updated FROM feed_items where created_at = '" ++ show day ++ "';" :: Query
+    let query = fromString $ "SELECT title, link, updated FROM feed_items where created_at = '" ++ show day ++ "' order by updated DESC;" :: Query
     failWith DatabaseError $ query_ conn query :: IO [FeedItem]
 
 logFeedItem :: FeedItem -> IO ()
 logFeedItem FeedItem {..} = putStrLn $ title ++ "(" ++ fromMaybe "" link ++ ")"
+
+feedItemsToHtml :: [FeedItem] -> String
+feedItemsToHtml items = "<ul>" ++ concatMap (\item -> "<li>" ++ feedItemToHtmlLink item ++ "</li>") items ++ "</ul>"
+  where
+    feedItemToHtmlLink :: FeedItem -> String
+    feedItemToHtmlLink FeedItem {..} =
+      "<div><a href='" ++ fromMaybe "#" link ++ "'>" ++ title ++ "</a> </div><div class=\"domain\">" ++ maybe "" showDay updated ++ " &bull; " ++ getDomain link ++ "</div>"
+
+writeDigest :: String -> Day -> [FeedItem] -> IO String
+writeDigest template day items = do
+  let filename = "digest-" ++ show day ++ ".html"
+      digestContents = replaceDigestSummary ("You have " ++ show (length items) ++ " posts to catch up on.") . replaceDigestContent (feedItemsToHtml items) . replaceDigestTitle ("Digest for " ++ showDay day ++ ":") $ template
+  failWith DigestError $ writeFile filename digestContents
+  pure filename
+
+getDomain :: Maybe String -> String
+getDomain url =
+  let maybeURI = url >>= parseURI >>= uriAuthority
+   in maybe "" uriRegName maybeURI
+
+replaceDigestContent :: String -> String -> String
+replaceDigestContent = replaceContent "{digestContent}"
+
+replaceDigestTitle :: String -> String -> String
+replaceDigestTitle = replaceContent "{digestTitle}"
+
+replaceDigestSummary :: String -> String -> String
+replaceDigestSummary = replaceContent "{digestSummary}"
+
+replaceContent :: String -> String -> String -> String
+replaceContent pattern replaceWith content = Data.Text.unpack $ replace (pack pattern) (pack replaceWith) (pack content)
+
+showDay :: Day -> String
+showDay day = formatTime defaultTimeLocale "%B %d, %Y" day

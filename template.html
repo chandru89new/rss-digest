@@ -1,0 +1,68 @@
+<html>
+
+<head>
+  <title>{digestTitle}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400..800;1,400..800&display=swap"
+    rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Prata&display=swap" rel="stylesheet" />
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      font-size: 24px;
+      font-weight: 400;
+      font-family: "Prata", "EB Garamond", serif;
+    }
+
+    body {
+      font-size: 1rem;
+      padding: 3rem;
+    }
+
+    h1 {
+      font-size: 2rem;
+      margin-bottom: 0.5rem;
+    }
+
+    ul {
+      list-style-type: none;
+      list-style-position: outside;
+    }
+
+    ul li {
+      margin-bottom: 0.6rem;
+    }
+
+    li .date {
+      font-size: 0.65em;
+      color: slategray;
+    }
+
+    ul li .domain {
+      font-size: 14px;
+      color: slategray;
+    }
+
+    a {
+      color: cornflowerblue;
+    }
+
+    p.summary {
+      font-size: 1rem;
+      font-style: italic;
+      margin: 0 0 2rem 0;
+      font-family: "EB Garamond";
+    }
+  </style>
+</head>
+
+<body>
+  <h1>{digestTitle}</h1>
+  <p class="summary">{digestSummary}</p>
+  {digestContent}
+</body>
+
+</html>
