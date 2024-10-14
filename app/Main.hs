@@ -45,7 +45,7 @@ main = do
         Just _url -> do
           runApp $ \config -> do
             res <- (try :: IO a -> IO (Either SomeException a)) $ insertFeed _url config
-            either print (const $ putStrLn "Done.") res
+            either print (const $ putStrLn "Added.") res
         Nothing -> putStrLn "Invalid URL."
     RemoveFeed url -> runApp $ \config -> do
       input <- userConfirmation "This will remove the feed and all the posts associated with it."

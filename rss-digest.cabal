@@ -19,7 +19,7 @@ maintainer:         chandru89new@gmail.com
 -- A copyright notice.
 -- copyright:
 -- category:
-extra-source-files: CHANGELOG.md, digest-template.html
+extra-source-files: CHANGELOG.md, template.html
 
 executable rss-digest
     main-is:          Main.hs
