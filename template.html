@@ -12,9 +12,12 @@
       margin: 0;
       padding: 0;
       box-sizing: border-box;
-      font-size: 24px;
       font-weight: 400;
       font-family: "Prata", "EB Garamond", serif;
+    }
+
+    html {
+      font-size: 24px;
     }
 
     body {
@@ -25,6 +28,12 @@
     h1 {
       font-size: 2rem;
       margin-bottom: 0.5rem;
+    }
+
+    h2.summary {
+      display: inline-block;
+      margin-bottom: 0.5rem;
+      cursor: pointer;
     }
 
     ul {
@@ -51,18 +60,43 @@
     }
 
     p.summary {
-      font-size: 1rem;
       font-style: italic;
       margin: 0 0 2rem 0;
       font-family: "EB Garamond";
     }
+
+    p.toggler {
+      margin-bottom: 1rem;
+      font-size: 0.7rem;
+      cursor: pointer;
+      position: fixed;
+      top: 1rem;
+      right: 1rem;
+    }
   </style>
+  <script>
+    let toggleState = false;
+    function toggle() {
+      toggleState = !toggleState;
+      setTimeout(() => {
+        const details = document.querySelectorAll("details");
+        details.forEach((detail) => {
+          detail.open = toggleState;
+        });
+      }, 10)
+    }
+  </script>
 </head>
 
 <body>
   <h1>{digestTitle}</h1>
   <p class="summary">{digestSummary}</p>
-  {digestContent}
+  <p class="toggler">
+    <span onclick="toggle();">Expand/collapse all</span>
+  </p>
+  <article>
+    {digestContent}
+  </article>
 </body>
 
 </html>

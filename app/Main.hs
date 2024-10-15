@@ -38,6 +38,10 @@ main = do
           _ <- initDB config
           pure ()
       )
+  main' command
+
+main' :: Command -> IO ()
+main' command =
   case command of
     AddFeed link -> do
       let url = parseURL link
@@ -46,6 +50,7 @@ main = do
           runApp $ \config -> do
             res <- (try :: IO a -> IO (Either SomeException a)) $ insertFeed _url config
             either print (const $ putStrLn "Added.") res
+            when (isRight res) $ processFeeds (fromRight [] res) config
         Nothing -> putStrLn "Invalid URL."
     RemoveFeed url -> runApp $ \config -> do
       input <- userConfirmation "This will remove the feed and all the posts associated with it."
@@ -266,10 +271,12 @@ insertFeedItem conn (feedId, addedOn, feedItem@FeedItem {..}) = do
 instance FromRow FeedItem where
   fromRow = FeedItem <$> field <*> field <*> field
 
-insertFeed :: URL -> App ()
+insertFeed :: URL -> App [(Int, URL)]
 insertFeed feedUrl (Config {..}) = do
-  let query = fromString $ "INSERT INTO feeds (url) VALUES ('" ++ feedUrl ++ "');"
-  withResource connPool $ \conn -> failWith DatabaseError $ execute_ conn query
+  let q = fromString $ "INSERT INTO feeds (url) VALUES ('" ++ feedUrl ++ "');"
+  withResource connPool $ \conn -> do
+    _ <- failWith DatabaseError $ execute_ conn q
+    failWith DatabaseError $ query_ conn (fromString $ "SELECT id, url FROM feeds where url = '" ++ feedUrl ++ "';")
 
 getFeedUrlsFromDB :: App [(Int, URL)]
 getFeedUrlsFromDB (Config {..}) = failWith DatabaseError $ withResource connPool handleQuery
@@ -388,11 +395,21 @@ runMigrations conn = do
   failWith DatabaseError $ execute_ conn updateCreatedAtFeeds
   failWith DatabaseError $ execute_ conn updateCreatedAtFeedItems
 
-createDigest :: Day -> App [FeedItem]
+type FeedItemWithId = (URL, FeedItem)
+
+createDigest :: Day -> App [(URL, [FeedItem])]
 createDigest day config =
   withResource (connPool config) $ \conn -> do
-    let query = fromString $ "SELECT title, link, updated FROM feed_items where created_at = '" ++ show day ++ "' order by updated DESC;" :: Query
-    failWith DatabaseError $ query_ conn query :: IO [FeedItem]
+    let query = fromString $ "select feeds.url, f.link, f.title, f.updated, f.created_at from feed_items f join feeds on f.feed_id = feeds.id where f.created_at = '" ++ show day ++ "' order by updated DESC;" :: Query
+    xs <- failWith DatabaseError $ query_ conn query :: IO [(String, String, String, Day, Day)]
+    pure $ groupByFeedUrl xs
+  where
+    groupByFeedUrl :: [(String, String, String, Day, Day)] -> [(URL, [FeedItem])]
+    groupByFeedUrl = foldr go' []
+      where
+        go' (url, link, title, updated, _) acc = case lookup url acc of
+          Just xs -> (url, FeedItem {title = title, link = Just link, updated = Just updated} : xs) : filter ((/= url) . fst) acc
+          Nothing -> (url, [FeedItem {title = title, link = Just link, updated = Just updated}]) : acc
 
 logFeedItem :: FeedItem -> IO ()
 logFeedItem FeedItem {..} = putStrLn $ title ++ "(" ++ fromMaybe "" link ++ ")"
@@ -404,12 +421,22 @@ feedItemsToHtml items = "<ul>" ++ concatMap (\item -> "<li>" ++ feedItemToHtmlLi
     feedItemToHtmlLink FeedItem {..} =
       "<div><a href='" ++ fromMaybe "#" link ++ "'>" ++ title ++ "</a> </div><div class=\"domain\">" ++ maybe "" showDay updated ++ " &bull; " ++ getDomain link ++ "</div>"
 
-writeDigest :: String -> Day -> [FeedItem] -> IO String
+writeDigest :: String -> Day -> [(URL, [FeedItem])] -> IO String
 writeDigest template day items = do
   let filename = "digest-" ++ show day ++ ".html"
-      digestContents = replaceDigestSummary ("You have " ++ show (length items) ++ " posts to catch up on.") . replaceDigestContent (feedItemsToHtml items) . replaceDigestTitle ("Digest for " ++ showDay day ++ ":") $ template
-  failWith DigestError $ writeFile filename digestContents
+  -- digestContents = replaceDigestSummary ("You have " ++ show (length items) ++ " posts to catch up on.") . replaceDigestContent (feedItemsToHtml items) . replaceDigestTitle ("Digest for " ++ showDay day ++ ":") $ template
+  failWith DigestError $ writeFile filename (generateDigestContent items)
   pure filename
+  where
+    generateDigestContent :: [(URL, [FeedItem])] -> String
+    generateDigestContent xs =
+      let titleReplaced = replaceDigestTitle ("Digest for " ++ showDay day ++ ":") template
+          summaryReplaced = replaceDigestSummary ("You have " ++ show (length $ concatMap snd xs) ++ " posts to catch up on.") titleReplaced
+          contentReplaced = replaceDigestContent (concatMap convertGroupToHtml xs) summaryReplaced
+       in contentReplaced
+
+    convertGroupToHtml :: (URL, [FeedItem]) -> String
+    convertGroupToHtml (url, xs) = "<details><summary><h2 class=\"summary\">" ++ url ++ "</h2> (" ++ show (length xs) ++ ")</summary><p>" ++ feedItemsToHtml xs ++ "</p></details>"
 
 getDomain :: Maybe String -> String
 getDomain url =
