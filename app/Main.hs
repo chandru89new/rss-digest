@@ -16,11 +16,12 @@ import Control.Monad.IO.Class (MonadIO (liftIO), liftIO)
 import Data.ByteString.Char8 as ByteString (unpack)
 import Data.Either (fromLeft, fromRight, isLeft, isRight)
 import Data.FileEmbed (embedFile)
-import Data.List (intercalate)
+import Data.List (intercalate, isInfixOf)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Pool (Pool, defaultPoolConfig, destroyAllResources, newPool, withResource)
 import Data.String (IsString (fromString))
-import Data.Text (pack, replace, strip, unpack)
+import Data.Text (Text, pack, replace, strip, unpack)
+import Data.Text.Encoding (decodeUtf8)
 import Data.Time (Day, UTCTime (utctDay), defaultTimeLocale, formatTime, getCurrentTime, parseTimeM)
 import Database.SQLite.Simple (Connection, FromRow (fromRow), Query, close, execute, execute_, field, open, query_, toRow)
 import Network.HTTP.Simple (getResponseBody, httpBS, parseRequest)
@@ -66,23 +67,29 @@ main' command =
       runApp $ \config -> do
         updateAllFeeds config
         putStrLn "Done."
-    CreateDigest dateString -> do
+    CreateTodayDigest -> do
       today <- fmap utctDay getCurrentTime
-      digestDay <- case dateString of
-        Just date -> (try :: IO a -> IO (Either SomeException a)) (parseTimeM True defaultTimeLocale "%Y-%m-%d" date :: IO Day)
-        Nothing -> pure $ Right today
-      case digestDay of
-        Right day -> do
-          runApp $ \config@Config {..} -> do
-            items <- createDigest day config
-            if null items
-              then putStrLn $ "No digest for " ++ show day ++ "."
-              else do
-                putStrLn $ "Preparing digest for " ++ show day ++ ":"
-                file <- writeDigest template day items
-                putStrLn $ "Digest written to " ++ file ++ "."
-        Left _ -> do
-          putStrLn "Invalid date format. Use YYYY-MM-DD or leave empty to get today's digest. (e.g 2020-01-01)"
+      runApp $ \config@Config {..} -> do
+        items <- createDigest (today, today) config
+        if null items
+          then putStrLn $ "No digest for " ++ showDay today ++ "."
+          else do
+            putStrLn $ "Preparing digest for " ++ showDay today ++ "..."
+            file <- writeDigest template (today, today) items
+            putStrLn $ "Digest written to " ++ file ++ "."
+    CreateRangeDigest argPairs -> do
+      from <- pure $ extractArgString "--from" argPairs >>= parseTimeM True defaultTimeLocale "%Y-%m-%d" :: IO (Maybe Day)
+      to <- pure $ extractArgString "--to" argPairs >>= parseTimeM True defaultTimeLocale "%Y-%m-%d" :: IO (Maybe Day)
+      runApp $ \config@Config {..} -> case (from, to) of
+        (Just s, Just e) -> do
+          items <- createDigest (s, e) config
+          if null items
+            then putStrLn "No digest for the selected date range."
+            else do
+              putStrLn $ "Preparing digest for " ++ showDay s ++ " to " ++ showDay e ++ "..."
+              file <- writeDigest template (s, e) items
+              putStrLn $ "Digest written to " ++ file ++ "."
+        (_, _) -> showAppError $ ArgError "Invalid date range. Please provide a valid date range in the format YYYY-MM-DD. Type 'rss-digest help' for more information."
     PurgeEverything -> do
       input <- userConfirmation "This will remove all feeds and all the posts associated with them."
       if input
@@ -101,7 +108,7 @@ progHelp =
   \  add <url> - Add a feed. <url> must be valid HTTP(S) URL.\n\
   \  remove <url> - Remove a feed and all its associated posts with the given url.\n\
   \  digest - Generate the digest for today.\n\
-  \  digest <date> - Generate the digest for a given [date] in the YYYY-MM-DD format.\n\
+  \  digest --from <start_date> --to <end_date> - Generate the digest for a given date range. Dates in the YYYY-MM-DD format.\n\
   \  list feeds - List all feeds\n\
   \  refresh - Refresh all feeds\n\
   \  purge - Purge everything\n"
@@ -111,9 +118,10 @@ data Command
   | RefreshFeeds
   | ListFeeds
   | RemoveFeed URL
-  | CreateDigest (Maybe String)
+  | CreateTodayDigest
   | PurgeEverything
   | InvalidCommand
+  | CreateRangeDigest [ArgPair]
   deriving (Eq)
 
 getCommand :: IO Command
@@ -124,7 +132,8 @@ getCommand = do
     ("remove" : url : _) -> RemoveFeed url
     ("list" : "feeds" : _) -> ListFeeds
     ("refresh" : _) -> RefreshFeeds
-    ("digest" : xs) -> CreateDigest (if null xs then Nothing else Just $ head xs)
+    ["digest"] -> CreateTodayDigest
+    ("digest" : xs) -> CreateRangeDigest $ groupCommandArgs xs
     ("purge" : _) -> PurgeEverything
     ("help" : _) -> InvalidCommand
     _ -> InvalidCommand
@@ -144,7 +153,7 @@ fetchUrl url = do
   res <- failWith FetchError $ do
     req <- parseRequest url
     httpBS req
-  pure $ (ByteString.unpack . getResponseBody) res
+  pure $ (Data.Text.unpack . replaceSmartQuotes . decodeUtf8 . getResponseBody) res
 
 type App a = Config -> IO a
 
@@ -152,6 +161,7 @@ data AppError
   = FetchError String
   | DatabaseError String
   | FeedParseError String
+  | ArgError String
   | DigestError String
   | GeneralError String
   deriving (Show)
@@ -168,7 +178,7 @@ runApp app = do
   let config = Config {connPool = pool, template = ByteString.unpack template}
   res <- (try :: IO a -> IO (Either AppError a)) $ app config
   destroyAllResources pool
-  either throw (const $ return ()) res
+  either print (const $ return ()) res
 
 trim :: String -> String
 trim = Data.Text.unpack . strip . pack
@@ -343,7 +353,14 @@ processFeeds :: [(Int, URL)] -> App ()
 processFeeds urls config = do
   utcTime <- getCurrentTime
   let addedOn = utctDay utcTime
-  mapM_ (\url -> processFeed url addedOn config) urls
+  mapM_
+    ( \url -> do
+        res <- (try :: IO a -> IO (Either AppError a)) $ processFeed url addedOn config
+        case res of
+          Left e -> showAppError e
+          Right _ -> pure ()
+    )
+    urls
 
 updateAllFeeds :: App ()
 updateAllFeeds config = do
@@ -397,17 +414,16 @@ runMigrations conn = do
 
 type FeedItemWithId = (URL, FeedItem)
 
-createDigest :: Day -> App [(URL, [FeedItem])]
-createDigest day config =
-  withResource (connPool config) $ \conn -> do
-    let query = fromString $ "select feeds.url, f.link, f.title, f.updated, f.created_at from feed_items f join feeds on f.feed_id = feeds.id where f.created_at = '" ++ show day ++ "' order by updated DESC;" :: Query
-    xs <- failWith DatabaseError $ query_ conn query :: IO [(String, String, String, Day, Day)]
-    pure $ groupByFeedUrl xs
+createDigest :: (Day, Day) -> App [(URL, [FeedItem])]
+createDigest (day1, day2) config = withResource (connPool config) $ \conn -> do
+  xs <- failWith DatabaseError $ query_ conn query :: IO [(String, String, String, Day)]
+  pure $ groupByFeedUrl xs
   where
-    groupByFeedUrl :: [(String, String, String, Day, Day)] -> [(URL, [FeedItem])]
+    query = fromString $ "select feeds.url, f.link, f.title, f.updated from feed_items f join feeds on f.feed_id = feeds.id where f.updated >= '" ++ show day1 ++ "' and f.updated <= '" ++ show day2 ++ "' order by updated DESC;"
+    groupByFeedUrl :: [(String, String, String, Day)] -> [(URL, [FeedItem])]
     groupByFeedUrl = foldr go' []
       where
-        go' (url, link, title, updated, _) acc = case lookup url acc of
+        go' (url, link, title, updated) acc = case lookup url acc of
           Just xs -> (url, FeedItem {title = title, link = Just link, updated = Just updated} : xs) : filter ((/= url) . fst) acc
           Nothing -> (url, [FeedItem {title = title, link = Just link, updated = Just updated}]) : acc
 
@@ -415,28 +431,33 @@ logFeedItem :: FeedItem -> IO ()
 logFeedItem FeedItem {..} = putStrLn $ title ++ "(" ++ fromMaybe "" link ++ ")"
 
 feedItemsToHtml :: [FeedItem] -> String
-feedItemsToHtml items = "<ul>" ++ concatMap (\item -> "<li>" ++ feedItemToHtmlLink item ++ "</li>") items ++ "</ul>"
+feedItemsToHtml items = "<ul>" ++ concatMap (\item@FeedItem {..} -> "<a class=\"li\" href=\"" ++ fromMaybe "" link ++ "\"><li>" ++ feedItemToHtmlLink item ++ "</li></a>") items ++ "</ul>"
   where
     feedItemToHtmlLink :: FeedItem -> String
     feedItemToHtmlLink FeedItem {..} =
-      "<div><a href='" ++ fromMaybe "#" link ++ "'>" ++ title ++ "</a> </div><div class=\"domain\">" ++ maybe "" showDay updated ++ " &bull; " ++ getDomain link ++ "</div>"
+      "<div class=\"title\">" ++ title ++ "</div><div class=\"domain\">" ++ getDomain link ++ " &bull; " ++ maybe "" showDay updated ++ "</div>"
 
-writeDigest :: String -> Day -> [(URL, [FeedItem])] -> IO String
-writeDigest template day items = do
-  let filename = "digest-" ++ show day ++ ".html"
-  -- digestContents = replaceDigestSummary ("You have " ++ show (length items) ++ " posts to catch up on.") . replaceDigestContent (feedItemsToHtml items) . replaceDigestTitle ("Digest for " ++ showDay day ++ ":") $ template
+writeDigest :: String -> (Day, Day) -> [(URL, [FeedItem])] -> IO String
+writeDigest template (day1, day2) items = do
+  let filename = "digest-" ++ show day2 ++ ".html"
   failWith DigestError $ writeFile filename (generateDigestContent items)
   pure filename
   where
     generateDigestContent :: [(URL, [FeedItem])] -> String
     generateDigestContent xs =
-      let titleReplaced = replaceDigestTitle ("Digest for " ++ showDay day ++ ":") template
+      let titleReplaced = replaceDigestTitle ("Digest — " ++ dateRange ++ ":") template
           summaryReplaced = replaceDigestSummary ("You have " ++ show (length $ concatMap snd xs) ++ " posts to catch up on.") titleReplaced
           contentReplaced = replaceDigestContent (concatMap convertGroupToHtml xs) summaryReplaced
        in contentReplaced
 
+    dateRange :: String
+    dateRange = if day1 == day2 then wrapDate (showDay day2) else wrapDate (showDay day1) ++ " to " ++ wrapDate (showDay day2)
+
+    wrapDate :: String -> String
+    wrapDate date = "<span class=\"digest-date\">" ++ date ++ "</span>"
+
     convertGroupToHtml :: (URL, [FeedItem]) -> String
-    convertGroupToHtml (url, xs) = "<details><summary><h2 class=\"summary\">" ++ url ++ "</h2> (" ++ show (length xs) ++ ")</summary><p>" ++ feedItemsToHtml xs ++ "</p></details>"
+    convertGroupToHtml (url, xs) = "<details open><summary><h2 class=\"summary\">" ++ url ++ "</h2> (" ++ show (length xs) ++ ")</summary><p>" ++ feedItemsToHtml xs ++ "</p></details>"
 
 getDomain :: Maybe String -> String
 getDomain url =
@@ -457,3 +478,54 @@ replaceContent pattern replaceWith content = Data.Text.unpack $ replace (pack pa
 
 showDay :: Day -> String
 showDay day = formatTime defaultTimeLocale "%B %d, %Y" day
+
+replaceSmartQuotes :: Text -> Text
+replaceSmartQuotes =
+  replace (pack "“") (pack "\"")
+    . replace (pack "”") (pack "\"")
+    . replace (pack "‘") (pack "'")
+    . replace (pack "’") (pack "'")
+
+type ArgPair = (String, ArgVal)
+
+data ArgVal = ArgBool Bool | ArgString String deriving (Eq, Show)
+
+groupCommandArgs :: [String] -> [ArgPair]
+groupCommandArgs = go []
+  where
+    go :: [ArgPair] -> [String] -> [ArgPair]
+    go acc [] = acc
+    go acc [x] = (x, ArgBool True) : acc
+    go acc (x : y : rest)
+      | isFlag x && not (isFlag y) = go ((x, ArgString y) : acc) rest
+      | isFlag x && isFlag y = go ((x, ArgBool True) : acc) (y : rest)
+      | otherwise = go acc (y : rest)
+      where
+        isFlag :: String -> Bool
+        isFlag str = "--" `isInfixOf` str && length str > 2
+
+{-
+if ("--test" : "value" : _) -> acc ++ [("test", "value")]
+if ("--test" : x starts with "--" : xs) -> acc ++ [("test", ArgBool True)] ++ go (x:xs)
+-}
+extractArgString :: String -> [ArgPair] -> Maybe String
+extractArgString key argPairs = lookup key argPairs >>= extractString
+  where
+    extractString :: ArgVal -> Maybe String
+    extractString (ArgString str) = Just str
+    extractString _ = Nothing
+
+extractArgBool :: String -> [ArgPair] -> Maybe Bool
+extractArgBool key argPairs = lookup key argPairs >>= extractBool
+  where
+    extractBool :: ArgVal -> Maybe Bool
+    extractBool (ArgBool bool) = Just bool
+    extractBool _ = Nothing
+
+showAppError :: AppError -> IO ()
+showAppError (FetchError msg) = putStrLn $ "Error fetching URL: " ++ msg
+showAppError (DatabaseError msg) = putStrLn $ "Database error: " ++ msg
+showAppError (FeedParseError msg) = putStrLn $ "Error parsing feed: " ++ msg
+showAppError (ArgError msg) = putStrLn $ "Argument error: " ++ msg
+showAppError (DigestError msg) = putStrLn $ "Digest error: " ++ msg
+showAppError (GeneralError msg) = putStrLn $ "Unknown error: " ++ msg
