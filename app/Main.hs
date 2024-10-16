@@ -92,7 +92,7 @@ main' command =
               putStrLn $ "I am now preparing digest for " ++ showDay s ++ " to " ++ showDay e ++ "..."
               file <- writeDigest template (s, e) items
               putStrLn $ "I have saved the digest file at " ++ file ++ "."
-        (_, _) -> showAppError $ ArgError "I couldn't understand the date range values. Provide a valid date range in the YYYY-MM-DD format. Type 'rss-digest help' for more information."
+        (_, _) -> showAppError $ ArgError "I couldn't understand the date range values. Provide a valid date range in the YYYY-MM-DD format. Type 'rdigest help' for more information."
     PurgeEverything -> do
       input <- userConfirmation "This will remove all feeds and all the posts associated with them."
       if input
@@ -105,7 +105,7 @@ main' command =
 
 progHelp :: String
 progHelp =
-  "Usage: rss-digest <command> [args]\n\
+  "Usage: rdigest <command> [args]\n\
   \Commands:\n\
   \  help - Show this help.\n\
   \  add <url> - Add a feed. <url> must be valid HTTP(S) URL.\n\
@@ -347,7 +347,7 @@ processFeed (feedId, url) addedOn (Config {..}) = do
   _ <- liftIO $ putStrLn $ "Processing: " ++ url
   _ <- withResource connPool $ \conn -> do
     feedIdExists <- failWith DatabaseError $ query_ conn (fromString $ "SELECT id FROM feeds where id = " ++ show feedId ++ ";") :: IO [FeedId]
-    when (null feedIdExists) $ throw $ DatabaseError "You have to first add this feed to your database. Try `rss-digest add <url>`."
+    when (null feedIdExists) $ throw $ DatabaseError "You have to first add this feed to your database. Try `rdigest add <url>`."
   contents <- fetchUrl url
   let feedItems = extractFeedItems contents
       unwrappedFeedItems = fromMaybe [] feedItems
