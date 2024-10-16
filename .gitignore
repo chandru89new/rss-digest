@@ -1,5 +1,4 @@
 dist-newstyle/
 feeds.csv
-feeds.db
-feeds_bak.db
+digest.db
 digest-*.html

@@ -49,34 +49,37 @@ main' command =
       case url of
         Just _url -> do
           runApp $ \config -> do
-            res <- (try :: IO a -> IO (Either SomeException a)) $ insertFeed _url config
-            either print (const $ putStrLn "Added.") res
+            res <- try $ insertFeed _url config
+            either showAppError (const $ putStrLn "Added.") res
             when (isRight res) $ processFeeds (fromRight [] res) config
-        Nothing -> putStrLn "Invalid URL."
+        Nothing -> putStrLn "I am not able to parse the URL. Please provide a valid URL."
     RemoveFeed url -> runApp $ \config -> do
       input <- userConfirmation "This will remove the feed and all the posts associated with it."
       if input
         then do
-          res <- (try :: IO a -> IO (Either SomeException a)) $ removeFeed url config
-          either print (const $ putStrLn "Done.") res
-        else putStrLn "Cancelled."
+          removeFeed url config
+        else putStrLn "I have cancelled it."
     ListFeeds -> runApp $ \config -> do
       feeds <- listFeeds config >>= pure . concat
       putStrLn $ intercalate "\n" feeds
+    RefreshFeed url -> do
+      runApp $ \config -> do
+        refreshFeed url config
+        putStrLn "I have refreshed the feed."
     RefreshFeeds -> do
       runApp $ \config -> do
         updateAllFeeds config
-        putStrLn "Done."
+        putStrLn "I have refreshed all the feeds."
     CreateTodayDigest -> do
       today <- fmap utctDay getCurrentTime
       runApp $ \config@Config {..} -> do
         items <- createDigest (today, today) config
         if null items
-          then putStrLn $ "No digest for " ++ showDay today ++ "."
+          then putStrLn $ "I can't create a digest for " ++ showDay today ++ ". There are no posts to make a digest out of."
           else do
-            putStrLn $ "Preparing digest for " ++ showDay today ++ "..."
+            putStrLn $ "I am now preparing digest for " ++ showDay today ++ ". Give me a few seconds..."
             file <- writeDigest template (today, today) items
-            putStrLn $ "Digest written to " ++ file ++ "."
+            putStrLn $ "I have saved the digest file at " ++ file ++ "."
     CreateRangeDigest argPairs -> do
       from <- pure $ extractArgString "--from" argPairs >>= parseTimeM True defaultTimeLocale "%Y-%m-%d" :: IO (Maybe Day)
       to <- pure $ extractArgString "--to" argPairs >>= parseTimeM True defaultTimeLocale "%Y-%m-%d" :: IO (Maybe Day)
@@ -84,12 +87,12 @@ main' command =
         (Just s, Just e) -> do
           items <- createDigest (s, e) config
           if null items
-            then putStrLn "No digest for the selected date range."
+            then putStrLn "There are not posts in the given range to make a digest."
             else do
-              putStrLn $ "Preparing digest for " ++ showDay s ++ " to " ++ showDay e ++ "..."
+              putStrLn $ "I am now preparing digest for " ++ showDay s ++ " to " ++ showDay e ++ "..."
               file <- writeDigest template (s, e) items
-              putStrLn $ "Digest written to " ++ file ++ "."
-        (_, _) -> showAppError $ ArgError "Invalid date range. Please provide a valid date range in the format YYYY-MM-DD. Type 'rss-digest help' for more information."
+              putStrLn $ "I have saved the digest file at " ++ file ++ "."
+        (_, _) -> showAppError $ ArgError "I couldn't understand the date range values. Provide a valid date range in the YYYY-MM-DD format. Type 'rss-digest help' for more information."
     PurgeEverything -> do
       input <- userConfirmation "This will remove all feeds and all the posts associated with them."
       if input
@@ -97,7 +100,7 @@ main' command =
           putStrLn "Nuking everything..."
           _ <- runApp destroyDB
           putStrLn "Fin."
-        else putStrLn "Cancelled."
+        else putStrLn "I have cancelled it."
     InvalidCommand -> putStrLn progHelp
 
 progHelp :: String
@@ -115,6 +118,7 @@ progHelp =
 
 data Command
   = AddFeed URL
+  | RefreshFeed URL
   | RefreshFeeds
   | ListFeeds
   | RemoveFeed URL
@@ -131,7 +135,8 @@ getCommand = do
     ("add" : url : _) -> AddFeed url
     ("remove" : url : _) -> RemoveFeed url
     ("list" : "feeds" : _) -> ListFeeds
-    ("refresh" : _) -> RefreshFeeds
+    ("refresh" : url : _) -> RefreshFeed url
+    ["refresh"] -> RefreshFeeds
     ["digest"] -> CreateTodayDigest
     ("digest" : xs) -> CreateRangeDigest $ groupCommandArgs xs
     ("purge" : _) -> PurgeEverything
@@ -178,7 +183,7 @@ runApp app = do
   let config = Config {connPool = pool, template = ByteString.unpack template}
   res <- (try :: IO a -> IO (Either AppError a)) $ app config
   destroyAllResources pool
-  either print (const $ return ()) res
+  either showAppError (const $ return ()) res
 
 trim :: String -> String
 trim = Data.Text.unpack . strip . pack
@@ -232,10 +237,14 @@ data FeedItem = FeedItem {title :: String, link :: Maybe String, updated :: Mayb
 data Feed = Feed {url :: String, name :: String} deriving (Show)
 
 parseDate :: String -> Maybe Day
-parseDate datetime = fmap utctDay $ firstJust $ map tryParse [fmt1, fmt2]
+parseDate datetime = fmap utctDay $ firstJust $ map tryParse [fmt1, fmt2, fmt3, fmt4, fmt5, fmt6]
   where
     fmt1 = "%Y-%m-%dT%H:%M:%S%z"
     fmt2 = "%a, %d %b %Y %H:%M:%S %z"
+    fmt3 = "%a, %d %b %Y %H:%M:%S %Z"
+    fmt4 = "%Y-%m-%dT%H:%M:%S%Z"
+    fmt5 = "%Y-%m-%dT%H:%M:%S%Q%z"
+    fmt6 = "%Y-%m-%dT%H:%M:%S%Q%Z"
     tryParse fmt = parseTimeM True defaultTimeLocale fmt datetime :: Maybe UTCTime
     firstJust :: [Maybe a] -> Maybe a
     firstJust xs = go xs Nothing
@@ -246,7 +255,7 @@ parseDate datetime = fmap utctDay $ firstJust $ map tryParse [fmt1, fmt2]
           Nothing -> go xs_ acc
 
 dbFile :: String
-dbFile = "./feeds.db"
+dbFile = "./digest.db"
 
 justRunQuery :: Connection -> Query -> IO ()
 justRunQuery conn query = do
@@ -280,6 +289,11 @@ insertFeedItem conn (feedId, addedOn, feedItem@FeedItem {..}) = do
 
 instance FromRow FeedItem where
   fromRow = FeedItem <$> field <*> field <*> field
+
+newtype FeedId = FeedId Int
+
+instance FromRow FeedId where
+  fromRow = FeedId <$> field
 
 insertFeed :: URL -> App [(Int, URL)]
 insertFeed feedUrl (Config {..}) = do
@@ -330,23 +344,26 @@ insertFeedQuery = fromString "INSERT INTO feed_items (title, link, updated, feed
 
 processFeed :: (Int, URL) -> Day -> App ()
 processFeed (feedId, url) addedOn (Config {..}) = do
-  _ <- liftIO $ putStrLn $ "Processing feed: " ++ url
+  _ <- liftIO $ putStrLn $ "Processing: " ++ url
+  _ <- withResource connPool $ \conn -> do
+    feedIdExists <- failWith DatabaseError $ query_ conn (fromString $ "SELECT id FROM feeds where id = " ++ show feedId ++ ";") :: IO [FeedId]
+    when (null feedIdExists) $ throw $ DatabaseError "You have to first add this feed to your database. Try `rss-digest add <url>`."
   contents <- fetchUrl url
   let feedItems = extractFeedItems contents
       unwrappedFeedItems = fromMaybe [] feedItems
-  when (isNothing feedItems) $ putStrLn $ "No posts found on link: " ++ url ++ "."
+  when (isNothing feedItems) $ putStrLn $ "I couldn't find anything on: " ++ url ++ "."
   res <-
     ( try $ failWith DatabaseError $ withResource connPool $ \conn -> do
         _ <- setPragmas conn
         mapM (handleInsert conn) unwrappedFeedItems
     ) ::
       IO (Either AppError [Int])
-  when ((not . null) unwrappedFeedItems && isRight res) $ liftIO $ putStrLn $ "Finished processing " ++ url ++ ". Discovered " ++ show (length unwrappedFeedItems) ++ " posts. Added " ++ show (sum $ fromRight [] res) ++ " posts (duplicates are ignored)."
+  when ((not . null) unwrappedFeedItems && isRight res) $ liftIO $ putStrLn $ "Finished processing " ++ url ++ ". I discovered " ++ show (length unwrappedFeedItems) ++ " posts. I have added " ++ show (sum $ fromRight [] res) ++ " posts to the database (duplicates are ignored)."
   where
     handleInsert :: Connection -> FeedItem -> IO Int
     handleInsert conn feedItem = do
       res <- (try $ insertFeedItem conn (feedId, addedOn, feedItem)) :: IO (Either AppError (Maybe FeedItem))
-      when (isLeft res) $ print (fromLeft (DatabaseError "Error inserting feed item") res)
+      when (isLeft res) $ print (fromLeft (DatabaseError "I ran into an error when trying to save a feed to the database.") res)
       pure $ either (const 0) (\r -> if isJust r then 1 else 0) res
 
 processFeeds :: [(Int, URL)] -> App ()
@@ -381,7 +398,7 @@ removeFeed url (Config {..}) =
   withResource connPool $ \conn -> do
     _ <- setPragmas conn
     res <- failWith DatabaseError $ query_ conn (fromString $ "SELECT id, url FROM feeds where url = '" ++ url ++ "';") :: IO [(Int, String)]
-    when (null res) $ throw $ DatabaseError "Feed not found."
+    when (null res) $ throw $ DatabaseError "I could not find any such feed in the database. Maybe it's already gone?"
     justRunQuery conn $ fromString $ "DELETE FROM feeds where url = '" ++ url ++ "';"
 
 listFeeds :: App [[String]]
@@ -529,3 +546,12 @@ showAppError (FeedParseError msg) = putStrLn $ "Error parsing feed: " ++ msg
 showAppError (ArgError msg) = putStrLn $ "Argument error: " ++ msg
 showAppError (DigestError msg) = putStrLn $ "Digest error: " ++ msg
 showAppError (GeneralError msg) = putStrLn $ "Unknown error: " ++ msg
+
+refreshFeed :: URL -> App ()
+refreshFeed url config@Config {..} = do
+  let query = fromString $ "select id, url from feeds where url = '" ++ url ++ "';"
+  res <- withResource connPool $ \conn -> failWith DatabaseError $ query_ conn query :: IO [(Int, String)]
+  case res of
+    [] -> throw $ DatabaseError $ "I could not find " ++ url ++ " in your list of feeds. Try `rdigest list feeds` to see your feeds."
+    (feedId, _) : _ -> do
+      processFeeds [(feedId, url)] config
