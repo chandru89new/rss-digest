@@ -1,4 +1,3 @@
 dist-newstyle/
-feeds.csv
-digest.db
+rdigest.db
 digest-*.html

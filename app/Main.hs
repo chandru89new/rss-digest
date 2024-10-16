@@ -108,12 +108,13 @@ progHelp =
   "Usage: rdigest <command> [args]\n\
   \Commands:\n\
   \  help - Show this help.\n\
-  \  add <url> - Add a feed. <url> must be valid HTTP(S) URL.\n\
-  \  remove <url> - Remove a feed and all its associated posts with the given url.\n\
+  \  add <feed_url> - Add a feed. <feed_url> must be valid HTTP(S) URL.\n\
+  \  remove <feed_url> - Remove a feed and all its associated posts with the given url.\n\
   \  digest - Generate the digest for today.\n\
   \  digest --from <start_date> --to <end_date> - Generate the digest for a given date range. Dates in the YYYY-MM-DD format.\n\
   \  list feeds - List all feeds\n\
   \  refresh - Refresh all feeds\n\
+  \  refresh <feed_url> - Refresh feed at <feed_url>. The <feed_url> must be already in your database.\n\
   \  purge - Purge everything\n"
 
 data Command
@@ -255,7 +256,7 @@ parseDate datetime = fmap utctDay $ firstJust $ map tryParse [fmt1, fmt2, fmt3, 
           Nothing -> go xs_ acc
 
 dbFile :: String
-dbFile = "./digest.db"
+dbFile = "./rdigest.db"
 
 justRunQuery :: Connection -> Query -> IO ()
 justRunQuery conn query = do
