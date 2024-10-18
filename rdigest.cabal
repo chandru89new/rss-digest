@@ -42,7 +42,9 @@ executable rdigest
                         resource-pool,
                         network-uri,
                         time,
-                        file-embed
+                        file-embed,
+                        deepseq
     hs-source-dirs:   app
     default-language: Haskell2010
-    ghc-options: -rtsopts=none -threaded -O2 -split-sections -Wall -Wincomplete-patterns
+    -- ghc-options: -rtsopts=none -threaded -split-sections -Wall -Wincomplete-patterns
+    ghc-options: -Wall -Wincomplete-patterns

@@ -10,17 +10,17 @@
 module Main where
 
 import Control.Applicative ((<|>))
-import Control.Exception (Exception, SomeException, throw, try)
-import Control.Monad (unless, when)
-import Control.Monad.IO.Class (MonadIO (liftIO), liftIO)
-import Data.ByteString.Char8 as ByteString (unpack)
+import Control.DeepSeq (deepseq)
+import Control.Exception (Exception, SomeException, evaluate, throw, try)
+import Control.Monad (forM_, unless, when)
+import qualified Data.ByteString.Char8 as BS (ByteString, unpack)
 import Data.Either (fromLeft, fromRight, isLeft, isRight)
 import Data.FileEmbed (embedFile)
 import Data.List (intercalate, isInfixOf)
-import Data.Maybe (fromMaybe, isJust, isNothing)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Pool (Pool, defaultPoolConfig, destroyAllResources, newPool, withResource)
 import Data.String (IsString (fromString))
-import Data.Text (Text, pack, replace, strip, unpack)
+import qualified Data.Text as T (Text, pack, replace, strip, unpack)
 import Data.Text.Encoding (decodeUtf8)
 import Data.Time (Day, UTCTime (utctDay), defaultTimeLocale, formatTime, getCurrentTime, parseTimeM)
 import Database.SQLite.Simple (Connection, FromRow (fromRow), Query, close, execute, execute_, field, open, query_, toRow)
@@ -154,12 +154,10 @@ failWith mkError action = do
   res <- (try :: IO a -> IO (Either SomeException a)) action
   pure $ either (throw . mkError . show) id res
 
-fetchUrl :: String -> IO String
-fetchUrl url = do
-  res <- failWith FetchError $ do
-    req <- parseRequest url
-    httpBS req
-  pure $ (Data.Text.unpack . replaceSmartQuotes . decodeUtf8 . getResponseBody) res
+fetchUrl :: String -> IO BS.ByteString
+fetchUrl url = failWith FetchError $ do
+  req <- parseRequest url
+  httpBS req >>= pure . getResponseBody
 
 type App a = Config -> IO a
 
@@ -181,13 +179,13 @@ runApp :: App a -> IO ()
 runApp app = do
   let template = $(embedFile "./template.html")
   pool <- newPool (defaultPoolConfig (open dbFile) close 60.0 10)
-  let config = Config {connPool = pool, template = ByteString.unpack template}
+  let config = Config {connPool = pool, template = BS.unpack template}
   res <- (try :: IO a -> IO (Either AppError a)) $ app config
   destroyAllResources pool
   either showAppError (const $ return ()) res
 
 trim :: String -> String
-trim = Data.Text.unpack . strip . pack
+trim = T.unpack . T.strip . T.pack
 
 getInnerText :: [Tag String] -> String
 getInnerText = trim . innerText
@@ -220,11 +218,11 @@ takeBetween start end tags = takeWhile (~/= end) $ dropWhile (~/= start) tags
 
 type URL = String
 
-extractFeedItems :: String -> Maybe [FeedItem]
+extractFeedItems :: BS.ByteString -> Maybe [FeedItem]
 extractFeedItems = parseContents
   where
     parseContents c =
-      let tags = parseTags c
+      let tags = parseTags (T.unpack $ decodeUtf8 c)
           entryTags = partitions (~== "<entry>") tags -- this is for youtube feeds only
           itemTags = partitions (~== "<item>") tags
        in case (itemTags, entryTags) of
@@ -291,7 +289,7 @@ insertFeedItem conn (feedId, addedOn, feedItem@FeedItem {..}) = do
 instance FromRow FeedItem where
   fromRow = FeedItem <$> field <*> field <*> field
 
-newtype FeedId = FeedId Int
+newtype FeedId = FeedId Int deriving (Show)
 
 instance FromRow FeedId where
   fromRow = FeedId <$> field
@@ -345,25 +343,26 @@ insertFeedQuery = fromString "INSERT INTO feed_items (title, link, updated, feed
 
 processFeed :: (Int, URL) -> Day -> App ()
 processFeed (feedId, url) addedOn (Config {..}) = do
-  _ <- liftIO $ putStrLn $ "Processing: " ++ url
-  _ <- withResource connPool $ \conn -> do
-    feedIdExists <- failWith DatabaseError $ query_ conn (fromString $ "SELECT id FROM feeds where id = " ++ show feedId ++ ";") :: IO [FeedId]
+  putStrLn $ "Processing: " ++ url
+  withResource connPool $ \conn -> do
+    _ <- setPragmas conn
+    feedIdExists <- failWith DatabaseError (query_ conn (fromString $ "SELECT id FROM feeds where id = " ++ show feedId ++ ";")) :: IO [FeedId]
     when (null feedIdExists) $ throw $ DatabaseError "You have to first add this feed to your database. Try `rdigest add <url>`."
-  contents <- fetchUrl url
-  let feedItems = extractFeedItems contents
-      unwrappedFeedItems = fromMaybe [] feedItems
-  when (isNothing feedItems) $ putStrLn $ "I couldn't find anything on: " ++ url ++ "."
-  res <-
-    ( try $ failWith DatabaseError $ withResource connPool $ \conn -> do
-        _ <- setPragmas conn
-        mapM (handleInsert conn) unwrappedFeedItems
-    ) ::
-      IO (Either AppError [Int])
-  when ((not . null) unwrappedFeedItems && isRight res) $ liftIO $ putStrLn $ "Finished processing " ++ url ++ ". I discovered " ++ show (length unwrappedFeedItems) ++ " posts. I have added " ++ show (sum $ fromRight [] res) ++ " posts to the database (duplicates are ignored)."
+    contents <- fetchUrl url
+    contents `deepseq` do
+      feedItems <- evaluate (extractFeedItems contents)
+      let unwrappedFeedItems = fromMaybe [] feedItems
+      when (null unwrappedFeedItems) $ putStrLn $ "I couldn't find anything on: " ++ url ++ "."
+      res <- (try $ failWith DatabaseError $ doInserts conn unwrappedFeedItems) :: IO (Either AppError [Int])
+      when ((not . null) unwrappedFeedItems && isRight res) $ putStrLn $ "Finished processing " ++ url ++ ". I discovered " ++ show (length unwrappedFeedItems) ++ " posts. I have added " ++ show (sum $ fromRight [] res) ++ " posts to the database (duplicates are ignored)."
   where
+    doInserts :: Connection -> [FeedItem] -> IO [Int]
+    doInserts conn = mapM (handleInsert conn)
+    -- doInserts conn feedItems = forM feedItems (handleInsert conn)
+
     handleInsert :: Connection -> FeedItem -> IO Int
     handleInsert conn feedItem = do
-      res <- (try $ insertFeedItem conn (feedId, addedOn, feedItem)) :: IO (Either AppError (Maybe FeedItem))
+      res <- try $ insertFeedItem conn (feedId, addedOn, feedItem) >>= evaluate :: IO (Either AppError (Maybe FeedItem))
       when (isLeft res) $ print (fromLeft (DatabaseError "I ran into an error when trying to save a feed to the database.") res)
       pure $ either (const 0) (\r -> if isJust r then 1 else 0) res
 
@@ -371,14 +370,11 @@ processFeeds :: [(Int, URL)] -> App ()
 processFeeds urls config = do
   utcTime <- getCurrentTime
   let addedOn = utctDay utcTime
-  mapM_
-    ( \url -> do
-        res <- (try :: IO a -> IO (Either AppError a)) $ processFeed url addedOn config
-        case res of
-          Left e -> showAppError e
-          Right _ -> pure ()
-    )
-    urls
+  forM_ urls $ \url -> do
+    res <- (try :: IO a -> IO (Either AppError a)) $ processFeed url addedOn config
+    case res of
+      Left e -> showAppError e
+      Right _ -> pure ()
 
 updateAllFeeds :: App ()
 updateAllFeeds config = do
@@ -464,7 +460,7 @@ writeDigest template (day1, day2) items = do
     generateDigestContent :: [(URL, [FeedItem])] -> String
     generateDigestContent xs =
       let titleReplaced = replaceDigestTitle ("Digest — " ++ dateRange ++ ":") template
-          summaryReplaced = replaceDigestSummary ("You have " ++ show (length $ concatMap snd xs) ++ " posts to catch up on.") titleReplaced
+          summaryReplaced = replaceDigestSummary ("You have " ++ show (Prelude.length $ concatMap snd xs) ++ " posts to catch up on.") titleReplaced
           contentReplaced = replaceDigestContent (concatMap convertGroupToHtml xs) summaryReplaced
        in contentReplaced
 
@@ -492,17 +488,17 @@ replaceDigestSummary :: String -> String -> String
 replaceDigestSummary = replaceContent "{digestSummary}"
 
 replaceContent :: String -> String -> String -> String
-replaceContent pattern replaceWith content = Data.Text.unpack $ replace (pack pattern) (pack replaceWith) (pack content)
+replaceContent pattern replaceWith content = T.unpack $ T.replace (T.pack pattern) (T.pack replaceWith) (T.pack content)
 
 showDay :: Day -> String
-showDay day = formatTime defaultTimeLocale "%B %d, %Y" day
+showDay = formatTime defaultTimeLocale "%B %d, %Y"
 
-replaceSmartQuotes :: Text -> Text
+replaceSmartQuotes :: T.Text -> T.Text
 replaceSmartQuotes =
-  replace (pack "“") (pack "\"")
-    . replace (pack "”") (pack "\"")
-    . replace (pack "‘") (pack "'")
-    . replace (pack "’") (pack "'")
+  T.replace (T.pack "“") (T.pack "\"")
+    . T.replace (T.pack "”") (T.pack "\"")
+    . T.replace (T.pack "‘") (T.pack "'")
+    . T.replace (T.pack "’") (T.pack "'")
 
 type ArgPair = (String, ArgVal)
 
